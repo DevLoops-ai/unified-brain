@@ -59,7 +59,18 @@ QA_VECTOR_STORE=qwen
 DEEPINFRA_API_KEY=...
 ```
 
-### 2. Ingest a repository
+### 2. See what will be indexed
+
+Before ingesting, a few seconds show which files the ingester covers symbol
+by symbol, which it stores whole, and which it skips (binary files are not
+stored). 
+
+```bash
+python ingester.py ~/code/xz scan-coverage
+```
+
+
+### 3. Ingest a repository
 
 The ingester reads the git history and writes one file,
 `<repo>/.unified-brain.db`. No LLM is used; it is CPU work plus git. When the
@@ -101,7 +112,7 @@ python next_claude.py ~/code/xz --resume
 
 To start over, delete the `.unified-brain.db` file.
 
-### 3. Embeddings (only if you need to redo them)
+### 4. Embeddings (only if you need to redo them)
 
 The ingest already runs the embedding pass for the provider in
 `CODE_EMBED_PASS2`. Two cases need the separate commands:
@@ -119,14 +130,6 @@ Both providers can live in the same database; `QA_VECTOR_STORE` picks the one
 questions use. Cost to expect: open62541's 277,080 body versions cost about
 $1.30 with Qwen on DeepInfra. Add `--dry-run` to count without embedding.
 
-### 4. Check what was indexed
-
-Which files the ingester covers symbol by symbol, which it stores whole, and
-which it skips (binary files are not stored):
-
-```bash
-python ingester.py ~/code/xz scan-coverage
-```
 
 ### 5. Start the service
 
@@ -171,12 +174,23 @@ The service also answers plain HTTP for scripts: `POST /api/retrieve`,
 
 ### What a question costs
 
-Measured on open62541 (300k lines of C, sparse comments), hard tracing
-questions: Jev $0.07–0.09 and 60–120 s per answer, plus the writer
-(about $0.02 on DeepSeek V4.1 Flash for 85k tokens in). Vague questions
-("what is this library for?") are cheaper on Jev but pull more text into the
-writer. Settings that change cost are in Part 2 of `env.example`; the defaults
-are the ones that held on our test questions.
+Measured with the configuration in Part 1 of `env.example`:
+
+- open62541 (300k lines of C, sparse comments), hard tracing questions:
+  Jev $0.07–0.09 in 15s, plus the writer: $0.01 on DeepSeek V4.1
+  Flash (85–110k tokens in, 6–11k out), most of it spent thinking before
+  the first word — 60–120 s per answer in total depending on provider speed/traffic.
+- xz (heavily commented): about the same per question, but the fixed
+  scoring step costs more ($0.036 vs $0.014 for the same 400 calls) because
+  xz's bodies carry many more tokens each.
+- Vague questions ("what is this library for?") are cheaper on Jev.
+- One comparison so far, same question, same Cursor model, caches cold:
+  Cursor exploring on its own used 9% of a $20 plan; with unified-brain
+  2% plus $0.12 of Jev. The answers are in `benchmarks/`.
+
+Each answer ends with a line of these numbers for your own run. Part 2 of
+`env.example` lists the constants that move them; the ones we tested are
+noted there.
 
 ## How it is built
 
