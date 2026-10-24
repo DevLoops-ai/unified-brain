@@ -1,11 +1,11 @@
 # unified-brain
 
-**Git-history memory for AI coding agents, by [DevLoops](https://devloops.ai).**
+**Persistent memory for System One coding agents, by [DevLoops](https://devloops.ai).**
 
 unified-brain reads a repository's whole git history and stores every version of
 every symbol — functions, types, macros, config entries — with the commit that
-introduced it, its call and reference edges, and a code embedding, in one SQLite
-file next to the repository (`<repo>/.unified-brain.db`). On top of that it
+introduced it, using tree-sitter, in one SQLite
+db inside the repository in question (`<repo>/.unified-brain.db`). On top of that it
 answers two questions, as of any commit:
 
 - **Ask** — "why does X do Y?", answered from the bodies that were live at the
