@@ -53,10 +53,10 @@ LLM_PROVIDER=llmbase
 LLM_API_KEY=...
 # Jev, through OpenRouter
 OPENROUTER_API_KEY=...
-# code embeddings: voyage, or qwen (then set DEEPINFRA_API_KEY instead)
-CODE_EMBED_PASS2=voyage
-QA_VECTOR_STORE=voyage
-VOYAGE_API_KEY=...
+# code embeddings: qwen (the benchmarks), or voyage (then set VOYAGE_API_KEY instead)
+CODE_EMBED_PASS2=qwen
+QA_VECTOR_STORE=qwen
+DEEPINFRA_API_KEY=...
 ```
 
 ### 2. Ingest a repository
