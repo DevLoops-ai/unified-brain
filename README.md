@@ -2,6 +2,38 @@
 
 **Persistent memory for System One coding agents, by [DevLoops](https://devloops.ai).**
 
+On 24/10/2026 I have published as OSS a framework I call unified-brain that allows fast, cheap and accurate (same class of frontier models and frontier harnesses but 18 times cheaper) evidence gathering, using the cheapest frontier AI model out there, Jev. The results have been phenomenal.
+
+The magic sauce is an intermediary OS (SQLITE) memory layer that facilitates retrieval, filtering and reasoning through a System One model, namely Jev.
+
+The agent spawned from unified-brain runs through MCP on Cursor, OpenCode or Claude Code etc. allowing you to use it through your favorite harness.
+
+So to be clear here: unified-brain is not only a harness but a perception layer any harness plugs in!
+
+My test benchmarks have been so good on two large OS libraries (found in benchmarks on this repo) that I really believe this is the missing link to make AI more reliable.
+
+This is because the limits holding back AI are:
+
+**The Reasoning and Hallucination Gap:**
+
+The LLM turn reasoning it is introducing uncertainty and probabilistic outcomes.
+
+BUT.. Unified-brain's System One discovery engine is producing replicable results across runs as they introduce minimal hallucinations, breaking the task in hundreds of yes or no calls.
+
+**Context Loss and Memory Limits:**
+
+Long-running coding tasks consume massive amounts of tokens, causing the agent to forget early instructions or lose track of large-scale architecture.
+
+BUT.. Unified-brain doesn't need cached memory thanks to the SQLITE persistent layer of context it operates with. It simply retrieves what it needs on the fly consuming minimal amounts of tokens that do not build up across questions. Every question is independent from one another as git diffs and commits will automatically be absorbed from the project's memory layer (still working on that last part).
+
+I invite you to fork the project and have a look for yourself! I firmly believe that memory intermediate structures combined with System One models will take AI capabilities to the next level soon.
+
+I understand that Jev is proprietary and creates a dependency BUT we need to remember that soon enough OS models as capable as it will come, giving OS end users the option to replace him.
+
+Meanwhile we should ride this wave of innovation in order to deliver new capabilities to end users, at prices and replicable accuracy that can't be easily beaten.
+
+**How it works**
+
 unified-brain reads a repository's whole git history and stores every version of
 every symbol — functions, types, macros, config entries — with the commit that
 introduced it, using tree-sitter, in one SQLite
