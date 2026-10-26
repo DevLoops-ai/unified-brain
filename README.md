@@ -8,7 +8,7 @@ The magic sauce is an intermediary OS (SQLITE) memory layer that facilitates ret
 
 The agent spawned from unified-brain runs through MCP on Cursor, OpenCode or Claude Code etc. allowing you to use it through your favorite harness.
 
-> So to be clear here: unified-brain is not only a harness but a perception layer any harness plugs in!
+> So to be clear here: unified-brain is not a harness but a perception layer any harness plugs in!
 
 My test benchmarks have been so good on two large OS libraries (found in benchmarks on this repo) that I really believe this is the missing link to make AI more reliable.
 
@@ -46,15 +46,17 @@ Perhaps the most exciting development however from this proposed shift (establis
 
 - **Reduced demand for frontier-model execution.** Reserving the generative model primarily for synthesis can reduce its total inference workload, potentially lowering the serving capacity needed for a fixed volume of tasks.
 
+- **Potentially greater serving capacity.** Reducing generative investigation could allow existing infrastructure to serve more correctly answered questions per minute by freeing model execution time and KV-cache capacity. The gain depends on the serving bottleneck and the resources required by Jev, retrieval, and final synthesis.
+
 - **Potentially fewer corrective attempts.** If structured discovery improves evidence completeness and accuracy, it can reduce costly follow-up investigation and answer regeneration.
 
 ---
 
 I invite you to fork the project and have a look for yourself! I firmly believe that memory intermediate structures combined with System One models will take AI capabilities to the next level soon.
 
-I understand that Jev is proprietary and creates a dependency BUT we need to remember that soon enough OS models as capable as it will come, giving OS end users the option to replace him.
+I understand that Jev is proprietary and creates a dependency BUT as time passes by, OS models will eventually close the gap between them and Jev, giving OS end users additional options. At the moment however, I must say, I have come to the conclusion after my experiments that there is no parity.
 
-Meanwhile we should ride this wave of innovation in order to deliver new capabilities to end users, at prices and replicable accuracy that can't be easily beaten.
+Right now, I believe we should ride this wave of innovation in order to deliver new capabilities to end users, at prices and replicable accuracy that can't be easily beaten.
 
 ## How it works
 
