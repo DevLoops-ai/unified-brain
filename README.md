@@ -67,14 +67,17 @@ Functions, Types, Macros`"]:::step
     VectorDB["3. Structural Vector DB"]:::step
     Candidates["Candidate Subsets"]:::process
     Filtered["Precision Matches"]:::process
-    Dynamic["`Jev Recursively Explores &
-Expands Call Chains / Dependencies`"]:::process
+    Dynamic["`Jev-Guided Iterative Exploration
+Follows Symbol References and Expands Evidence`"]:::process
+    Writer["`Single LLM Call
+Synthesizes the Answer from Gathered Evidence`"]:::step
 
     Code -->|Tree-sitter Parsing| Entities
     Entities -->|Embedding Pass| VectorDB
     VectorDB -->|Tier 1: Initial Retrieval| Candidates
     Candidates -->|Tier 2: Jev Re-Scoring| Filtered
-    Filtered -->|Tier 3: Smart System One Grep Discovery| Dynamic
+    Filtered -->|Tier 3: Smart Grep Discovery| Dynamic
+    Dynamic -->|Compiled Evidence| Writer
 ```
 
 I understand that Jev is proprietary and creates a dependency BUT as time passes by, I expect open-source models to narrow the gap over time, giving OS end users additional options. At the moment however, I must say, I have come to the conclusion after my limited experiments, that there is no parity.
