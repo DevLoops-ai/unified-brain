@@ -54,7 +54,9 @@ Perhaps the most exciting development however from this proposed shift (establis
 
 I invite you to fork the project and have a look for yourself! I firmly believe that memory intermediate structures combined with System One models will take AI capabilities to the next level soon.
 
-I understand that Jev is proprietary and creates a dependency BUT as time passes by, OS models will eventually close the gap between them and Jev, giving OS end users additional options. At the moment however, I must say, I have come to the conclusion after my experiments that there is no parity.
+The philosophy behind this venture is to address contemporary inference issues in SWE through architectural elegance, rather than relying primarily on brute force scaling.
+
+I understand that Jev is proprietary and creates a dependency BUT as time passes by, I expect open-source models to narrow the gap over time, giving OS end users additional options. At the moment however, I must say, I have come to the conclusion after my limited experiments, that there is no parity.
 
 Right now, I believe we should ride this wave of innovation in order to deliver new capabilities to end users, at prices and replicable accuracy that can't be easily beaten.
 
