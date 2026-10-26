@@ -8,23 +8,47 @@ The magic sauce is an intermediary OS (SQLITE) memory layer that facilitates ret
 
 The agent spawned from unified-brain runs through MCP on Cursor, OpenCode or Claude Code etc. allowing you to use it through your favorite harness.
 
-So to be clear here: unified-brain is not only a harness but a perception layer any harness plugs in!
+> So to be clear here: unified-brain is not only a harness but a perception layer any harness plugs in!
 
 My test benchmarks have been so good on two large OS libraries (found in benchmarks on this repo) that I really believe this is the missing link to make AI more reliable.
 
 This is because the limits holding back AI are:
 
-**The Reasoning and Hallucination Gap:**
+- **The Reasoning and Hallucination Gap**:
 
 The LLM turn reasoning it is introducing uncertainty and probabilistic outcomes.
 
 BUT.. Unified-brain's System One discovery engine is producing replicable results across runs as they introduce minimal hallucinations, breaking the task in hundreds of yes or no calls.
 
-**Context Loss and Memory Limits:**
+- **Context Loss and Memory Limits**:
 
 Long-running coding tasks consume massive amounts of tokens, causing the agent to forget early instructions or lose track of large-scale architecture.
 
 BUT.. Unified-brain doesn't need cached memory thanks to the SQLITE persistent layer of context it operates with. It simply retrieves what it needs on the fly consuming minimal amounts of tokens that do not build up across questions. Every question is independent from one another as git diffs and commits will automatically be absorbed from the project's memory layer (still working on that last part).
+
+---
+
+Perhaps the most exciting development however from this proposed shift (established turn based exploration to System One evidence gathering) might be that avoiding unnecessary autoregressive investigation can reduce repeated weight and attention-state memory traffic. By using persistent retrieval and non-autoregressive judgments for discovery, unified-brain has a credible mechanism for reducing energy per correctly answered question — even when the conventional agent uses prompt caching.
+
+**Several architectural factors support this optimism:**
+
+- **Fewer intermediate decoding steps—even with caching.** In a conventional full-attention agent, each generated reasoning or tool-selection token attends to the accumulated context through its KV cache. Caching avoids recomputing earlier token states, but does not eliminate the attention work and memory access needed for subsequent generation. By replacing many intermediate generated tokens with bounded non-autoregressive judgments, unified-brain can avoid those repeated accesses during discovery.
+
+- **Reduced KV-cache pressure.** Keeping investigation state outside the generative model can reduce the intermediate tokens whose attention states must be stored, accessed, or recomputed.
+
+- **Less attention over exploration history.** The writer can receive selected evidence without repeatedly attending to unsuccessful searches, redundant tool results, and earlier investigative discussion.
+
+- **Less repeated prefill work when caching misses.** Separating discovery from synthesis reduces opportunities for growing or changing prompts to trigger redundant computation.
+
+- **Reusable repository preparation.** Persistent symbol and history indexes spread the cost of parsing and organizing evidence across many questions.
+
+- **Efficient execution of independent judgments.** Non-autoregressive decisions can be batched or run concurrently, creating opportunities for better hardware utilization without generating intermediate prose.
+
+- **Reduced demand for frontier-model execution.** Reserving the generative model primarily for synthesis can reduce its total inference workload, potentially lowering the serving capacity needed for a fixed volume of tasks.
+
+- **Potentially fewer corrective attempts.** If structured discovery improves evidence completeness and accuracy, it can reduce costly follow-up investigation and answer regeneration.
+
+---
 
 I invite you to fork the project and have a look for yourself! I firmly believe that memory intermediate structures combined with System One models will take AI capabilities to the next level soon.
 
@@ -32,7 +56,7 @@ I understand that Jev is proprietary and creates a dependency BUT we need to rem
 
 Meanwhile we should ride this wave of innovation in order to deliver new capabilities to end users, at prices and replicable accuracy that can't be easily beaten.
 
-**How it works**
+## How it works
 
 unified-brain reads a repository's whole git history and stores every version of
 every symbol — functions, types, macros, config entries — with the commit that
