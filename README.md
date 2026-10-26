@@ -56,6 +56,27 @@ I invite you to fork the project and have a look for yourself! I firmly believe 
 
 The philosophy behind this venture is to address contemporary inference issues in SWE through architectural elegance, rather than relying primarily on brute force scaling.
 
+```mermaid
+flowchart TD
+    classDef step fill:#2d3748,stroke:#4a5568,stroke-width:2px,color:#fff;
+    classDef process fill:#2b6cb0,stroke:#3182ce,stroke-width:2px,color:#fff;
+
+    Code["1. Raw Git Repository"]
+    Entities["`2. Syntax-Isolated Entities
+Functions, Types, Macros`"]:::step
+    VectorDB["3. Structural Vector DB"]:::step
+    Candidates["Candidate Subsets"]:::process
+    Filtered["Precision Matches"]:::process
+    Dynamic["`Jev Recursively Explores &
+Expands Call Chains / Dependencies`"]:::process
+
+    Code -->|Tree-sitter Parsing| Entities
+    Entities -->|Embedding Pass| VectorDB
+    VectorDB -->|Tier 1: Initial Retrieval| Candidates
+    Candidates -->|Tier 2: Jev Re-Scoring| Filtered
+    Filtered -->|Tier 3: Smart System One Grep Discovery| Dynamic
+```
+
 I understand that Jev is proprietary and creates a dependency BUT as time passes by, I expect open-source models to narrow the gap over time, giving OS end users additional options. At the moment however, I must say, I have come to the conclusion after my limited experiments, that there is no parity.
 
 Right now, I believe we should ride this wave of innovation in order to deliver new capabilities to end users, at prices and replicable accuracy that can't be easily beaten.
