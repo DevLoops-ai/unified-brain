@@ -2,15 +2,15 @@
 
 **Persistent memory for System One coding agents, by [DevLoops](https://devloops.ai).**
 
-On 24/10/2026 I have published as OSS a framework I call unified-brain that allows fast, cheap and accurate (same class of frontier models and frontier harnesses but 18 times cheaper) evidence gathering, using the cheapest frontier AI model out there, Jev. The results have been phenomenal.
+On 24/10/2026 I have published as OSS a framework I call unified-brain: evidence gathering that is fast and cheap, and close to a frontier coding agent in accuracy. On the same nine-question, 74-point xz benchmark (`evals/xz.md`) it scored 86.5 % against 94.6 % for a Claude Opus 5.5 agent and 93.2 % for a Claude Fable 5.1 agent, at 1/10 and 1/26 of their cost (prompt caching on), 2–3× faster, with zero wrong claims. The gathering is done by Jev, a small judge model, not by the frontier model.
 
-The magic sauce is an intermediary OS (SQLITE) memory layer that facilitates retrieval, filtering and reasoning through a System One model, namely Jev.
+The magic sauce is an intermediary OS (SQLITE) memory layer that facilitates retrieval, filtering and judging through a System One model, namely Jev.
 
 The agent spawned from unified-brain runs through MCP on Cursor, OpenCode or Claude Code etc. allowing you to use it through your favorite harness.
 
 > So to be clear here: unified-brain is not a harness but a perception layer any harness plugs in!
 
-My test benchmarks have been so good on two large OS libraries (found in benchmarks on this repo) that I really believe this is the missing link to make AI more reliable.
+The benchmarks on two large OS libraries (xz and open62541, in `evals/` on this repo) are close enough to the frontier agents, at a fraction of their cost, that I believe this is a missing link to make AI more reliable.
 
 This is because the limits holding back AI are:
 
@@ -18,13 +18,13 @@ This is because the limits holding back AI are:
 
 The LLM turn reasoning it is introducing uncertainty and probabilistic outcomes.
 
-BUT.. Unified-brain's System One discovery engine is producing replicable results across runs as they introduce minimal hallucinations, breaking the task in hundreds of yes or no calls.
+BUT.. Unified-brain's System One discovery engine breaks the task into hundreds of yes-or-no calls, so the search itself does not reason in prose and cannot hallucinate a path. In the graded xz set the answers contained zero wrong claims in the cheap configuration and one in the expensive one (a writer slip, not a retrieval error). Replicability across runs has not been measured yet: one run per question so far.
 
 - **Context Loss and Memory Limits**:
 
 Long-running coding tasks consume massive amounts of tokens, causing the agent to forget early instructions or lose track of large-scale architecture.
 
-BUT.. Unified-brain doesn't need cached memory thanks to the SQLITE persistent layer of context it operates with. It simply retrieves what it needs on the fly consuming minimal amounts of tokens that do not build up across questions. Every question is independent from one another as git diffs and commits will automatically be absorbed from the project's memory layer (still working on that last part).
+BUT.. Unified-brain doesn't need cached memory thanks to the SQLITE persistent layer of context it operates with. It simply retrieves what it needs on the fly: the writer reads 80 k tokens per question on average (2 k to 166 k) against 1.1–2.2 M billed tokens per question for the frontier agents, and nothing builds up across questions. Every question is independent from one another as git diffs and commits will automatically be absorbed from the project's memory layer (still working on that last part).
 
 ---
 
@@ -49,6 +49,8 @@ Perhaps the most exciting development however from this proposed shift (establis
 - **Potentially greater serving capacity.** Reducing generative investigation could allow existing infrastructure to serve more correctly answered questions per minute by freeing model execution time and KV-cache capacity. The gain depends on the serving bottleneck and the resources required by Jev, retrieval, and final synthesis.
 
 - **Potentially fewer corrective attempts.** If structured discovery improves evidence completeness and accuracy, it can reduce costly follow-up investigation and answer regeneration.
+
+None of the energy savings has been measured. The measured quantities are tokens, dollars and seconds, in `evals/`.
 
 ---
 
@@ -82,7 +84,7 @@ Synthesizes the Answer from Gathered Evidence`"]:::step
 
 I understand that Jev is proprietary and creates a dependency BUT as time passes by, I expect open-source models to narrow the gap over time, giving OS end users additional options. At the moment however, I must say, I have come to the conclusion after my limited experiments, that there is no parity.
 
-Right now, I believe we should ride this wave of innovation in order to deliver new capabilities to end users, at prices and replicable accuracy that can't be easily beaten.
+Right now, I believe we should ride this wave of innovation in order to deliver new capabilities to end users at a price the frontier agents do not reach today.
 
 ## How it works
 
@@ -271,6 +273,11 @@ Measured with the configuration in Part 1 of `env.example`:
 - One comparison so far, same question, same Cursor model, caches cold:
   Cursor exploring on its own used 9% of a $20 plan; with unified-brain
   2% plus $0.12 of Jev. The answers are in `benchmarks/`.
+- Nine xz questions, 74 reference points, against Claude Opus 5.5 and
+  Fable 5.1 agents with shell access (one run each, prompt caching on):
+  unified-brain 64 / 74 at $0.685 and 591 s; Opus 70 / 74 at $6.84 and
+  1,183 s; Fable 69 / 74 at $17.55 and 1,736 s. Grader: Fable 5.1, with
+  the keys fixed before the runs. Details in `evals/xz.md`.
 
 Each answer ends with a line of these numbers for your own run. Part 2 of
 `env.example` lists the constants that move them; the ones we tested are
