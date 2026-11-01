@@ -1159,7 +1159,12 @@ def _jev_triage_hits(client, state: dict, hits: list[dict], around: int = 3):
                              "help answer the `question`, given what is "
                              "`already_established`? A test, an example or another "
                              "platform's copy of the same function helps only if the "
-                             "question is about that."),
+                             "question is about that. A build file, a configure "
+                             "script or a configuration that names the file reached "
+                             "from decides when that file is compiled or used; it "
+                             "helps when the question asks under which conditions, "
+                             "on which platforms or with which options something "
+                             "happens."),
         }
     payload = {"model": JEV_MODEL,
                "state": {**state, "places": "\n\n".join(shown)},
@@ -1427,10 +1432,23 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                              if took else "")})
             return list(n.get("extra") or []) + picked
 
-        # (a) who mentions this file or this symbol
+        # (a) who mentions this file or this symbol: the links upward (the
+        # build file that compiles it, a checker that lists it, its callers).
+        # Few by construction (_mentions drops a name found in more than
+        # max_hits places), and the only route up. Read in full, never
+        # triaged: triage sees a few lines of a build file and says no.
         for name in (base, own):
             if name and len(name) >= 4:
-                out += _mentions(name, f"it mentions `{name}`")
+                # Upward links only: a build file, a test or a script that
+                # names this source file. Not the file's own body (every
+                # source names itself in its header comment), and not the
+                # includers of a header (#include lines; the triage judges
+                # those well). Q3 log, 2026-11-01: 60 of 109 reverse reads
+                # were those two, with 1 accept among the includers.
+                out += [{**c, "reverse": (name == base
+                                          and c.get("file") != n["file"]
+                                          and not base.endswith(".h"))}
+                        for c in _mentions(name, f"it mentions `{name}`")]
 
         # Names the judge chose to follow come first, and replace the blind
         # picks below. Seeds from the start selection have no such list.
@@ -1645,6 +1663,8 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
             if os.environ.get("JEV_HIT_TRIAGE", "1") == "1" and not use_llm_judge:
                 groups: dict = {}
                 for c in cands:
+                    if c.get("reverse"):
+                        continue               # link upward: read in full
                     m = re.search(r"it mentions `([^`]+)`", c.get("why") or "")
                     if m and c.get("hit") is not None:
                         groups.setdefault((id(c["parent"]), m.group(1)), []).append(c)
