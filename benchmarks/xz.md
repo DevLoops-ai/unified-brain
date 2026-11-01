@@ -76,8 +76,7 @@ without pledge / Landlock / Capsicum has not read the code.
 
 ## Q3 — the whole decompression path
 
-> Walk me through the full decompression path from input bytes to output,
-> naming the main stages.
+> Walk me through the full decompression path from input bytes to output, naming the main stages.
 
 Reference points:
 
@@ -117,8 +116,7 @@ listing files.
 
 ## Q4 — test fixture integrity
 
-> What mechanisms in this codebase verify or constrain the integrity of
-> test fixture files?
+> What mechanisms in this codebase verify or constrain the integrity of test fixture files?
 
 Reference points (`tests/tuktest.h`, `tests/test_lzip_decoder.c`,
 `tests/test_files.sh`, `tests/test_compress.sh`, `build-aux/license-check.sh`):
@@ -154,9 +152,7 @@ manifest is wrong.
 
 ## Q5 — padding, next stream, garbage
 
-> When decoding concatenated .xz streams, how does the decoder distinguish
-> valid stream padding, the start of another stream, and trailing garbage —
-> and under what conditions does each case become an error?
+> When decoding concatenated .xz streams, how does the decoder distinguish valid stream padding, the start of another stream, and trailing garbage — and under what conditions does each case become an error?
 
 Reference points (`SEQ_STREAM_PADDING`, `SEQ_STREAM_HEADER` in
 `stream_decoder.c` / `stream_decoder_mt.c`):
@@ -185,8 +181,7 @@ a bad Stream Header (6).
 
 ## Q6 — memory limit in the threaded decoder
 
-> How is the decompression memory limit enforced in the multithreaded
-> decoder, and what happens when a block would exceed the available memory?
+> How is the decompression memory limit enforced in the multithreaded decoder, and what happens when a block would exceed the available memory?
 
 Reference points (`stream_decoder_mt.c` `SEQ_BLOCK_INIT`,
 `SEQ_BLOCK_THR_INIT`):
@@ -214,8 +209,7 @@ Trap: `memlimit_threading` never produces `LZMA_MEMLIMIT_ERROR`.
 
 ## Q7 — when xz deletes the input file
 
-> Under what exact conditions can xz delete the original input file after
-> compression or decompression, and what checks can prevent that deletion?
+> Under what exact conditions can xz delete the original input file after compression or decompression, and what checks can prevent that deletion?
 
 Reference points (`src/xz/file_io.c`, `src/xz/coder.c`, `src/xz/args.c`):
 
@@ -242,10 +236,7 @@ the input deletion.
 
 ## Q8 — an attacker modifies the Index
 
-> Suppose an attacker modifies the Index of an otherwise valid .xz file
-> without changing the Blocks. Walk through every independent consistency or
-> integrity check that can detect the modification, and identify
-> modifications that could survive one check but fail a later one.
+> Suppose an attacker modifies the Index of an otherwise valid .xz file without changing the Blocks. Walk through every independent consistency or integrity check that can detect the modification, and identify modifications that could survive one check but fail a later one.
 
 Reference points (`src/liblzma/common/index_hash.c`, `stream_decoder*.c`):
 
@@ -277,11 +268,7 @@ not stored in the file; calling it "the Index CRC" misses the mechanism.
 
 ## Q9 — the long concatenated-streams question
 
-> *(the full text is in `benchmarks/xz-q10.md` (file name kept); it asks for the path from
-> the last Block of one Stream to the first Block of the next, the failure
-> cases under an attacker who can recompute CRCs, the concatenated vs.
-> single-stream behaviour, and the interaction with the threaded decoder
-> and memory limits.)*
+> Suppose xz is decompressing an .xz file that contains multiple concatenated Streams, with Stream Padding between them, and the decoder is running through the normal command-line decompression path with multithreaded decoding enabled and a finite memory limit. Walk me through what happens from the point where the first Stream's final Block finishes decoding until the decoder either begins decoding the first Block of the next Stream or terminates with an error. I want the actual implementation path rather than just the .xz format specification: identify the important decoder states/functions involved in finishing the Block, validating its Check, processing and validating the Index, validating the Stream Footer, consuming Stream Padding, recognizing the next Stream Header, and handing control back into Block decoding. Explain which pieces of state or accumulated information connect these stages—for example, how information learned while decoding Blocks is later used to decide whether the Index is consistent with what was actually decoded. Now introduce failures at several different points in that same path. Assume an attacker can modify bytes in the Index, Footer, padding, or beginning of the following Stream and can recompute ordinary CRC fields when necessary. Explain which modifications are caught by CRC validation alone and which are caught by independent structural or cross-stage consistency checks. In particular, trace what happens if an Index record contains plausible but incorrect Block sizes, if the Index is internally valid but its encoded size disagrees with the Footer's Backward Size, if the Stream Padding contains a nonzero byte or has an invalid length, or if the bytes following valid padding look like the beginning of another Stream but form only a partial or invalid Stream Header. For each case, identify where the implementation detects the problem, what state the decoder is in, whether more input can change the outcome, and what error or return status eventually propagates toward the caller. Distinguish behavior when concatenated-stream decoding is enabled from behavior when the decoder is allowed to stop after one Stream. Finally, connect this to the multithreaded decoder and memory-limiting machinery rather than treating the stream parser in isolation. Explain which parts of the above validation must wait for worker-decoded Block results, what information from completed Blocks has to survive until Index verification, and what happens if the next Block is valid but its memory requirements exceed the amount currently available for threaded decoding. Distinguish a condition that merely prevents the Block from being scheduled concurrently from one that makes the Block impossible to decode under the hard memory limit, and trace how either outcome interacts with normal stream completion and error propagation. Where relevant, point to tests, format documentation, or API contracts that independently confirm the implementation behavior, and call out any platform/configuration or decoder-mode differences that materially change the path.
 
 Reference points: the union of Q8 (Index), Q5 (padding and next header)
 and Q6 (memory limits), plus:

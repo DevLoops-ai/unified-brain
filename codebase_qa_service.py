@@ -748,7 +748,11 @@ def _jev_select(question: str, org_redis,
                                  "described in `description`) for answering this "
                                  f"question about the codebase: {question}"),
                 "criteria": [
-                    "Not relevant: has nothing to do with the question",
+                    "Not relevant: has nothing to do with the question, or is a "
+                    "derived copy of text that exists elsewhere in the repository "
+                    "in its original form — a translation or localisation catalog, "
+                    "a mirrored or generated file — which adds nothing the original "
+                    "does not",
                     "Loosely related: same area of the codebase, but does not help answer the question",
                     "Relevant: it is part of a mechanism the question asks about",
                     "Directly relevant: this code itself does what the question asks about",
@@ -828,9 +832,8 @@ def _jev_select(question: str, org_redis,
 
 
 _NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{3,}")
-
-
-
+# a name in member position: `->name` or `.name`
+_MEMBER_RE = re.compile(r"(?:->|\.)\s*([A-Za-z_][A-Za-z0-9_]{3,})")
 
 _JEV_VERDICTS = {
     "accept":   "Yes, this helps answer the question.",
@@ -1082,6 +1085,22 @@ def _name_pool(org_redis, c: dict) -> list[str]:
         if t != own and t not in toks:
             toks.append(t)
     toks = toks[:200]
+    # Struct members read or written in this body (`pair->src_st`,
+    # `strm.avail_in`). Not symbols, so the filter below drops them; yet
+    # they are the link upward: the function that fills `src_st` is the
+    # one with the checks (Q7, 2026-11-01). Offered after the symbols.
+    #
+    # Shaped on xz (C). NOT YET MEASURED on a dynamic language: in
+    # TypeScript/JS or Python `.` is everywhere, so this list gets long
+    # and full of `length`, `push`, `log`, `self`. Two things keep that
+    # in check without language-specific rules — members come after the
+    # symbols in the pool (they fill spare slots), and Jev decides what to
+    # follow — but the cost when Jev picks `.length` on a TS repo is
+    # unknown. Run a small TS or Python eval before trusting this there.
+    members: list[str] = []
+    for t in _MEMBER_RE.findall(near):
+        if t != own and t in toks and t not in members:
+            members.append(t)
     if not toks:
         return []
     try:
@@ -1093,9 +1112,12 @@ def _name_pool(org_redis, c: dict) -> list[str]:
         print(f"⚠️  name pool lookup failed (non-fatal): {_scrub(str(e))}")
         return []
     whole = c.get("struct") in ("module", "blob") or sym.startswith("<")
-    return [t for t, k in zip(toks, counts)
+    by_name = dict(zip(toks, counts))
+    pool = [t for t, k in zip(toks, counts)
             if (1 <= k <= max_defs)
-            or (whole and k == 0 and "_" in t and len(t) >= 6)][:pool_max]
+            or (whole and k == 0 and "_" in t and len(t) >= 6)]
+    pool += [t for t in members if t not in pool and by_name.get(t, 0) == 0]
+    return pool[:pool_max]
 
 
 _NONE_NAME = "(none of these)"
@@ -1140,6 +1162,17 @@ def _jev_triage_hits(client, state: dict, hits: list[dict], around: int = 3):
     occurrence. Returns ({index: probability that opening it helps}, cost);
     an empty dict means the call failed (the caller then opens everything,
     as without triage)."""
+    if len(hits) > 30:
+        # many places: several calls of 30, same question each; every place
+        # is judged, none is dropped for being one of many
+        probs, cost = {}, 0.0
+        for start in range(0, len(hits), 30):
+            p, c_ = _jev_triage_hits(client, state, hits[start:start + 30], around)
+            if not p and c_ == 0.0:
+                return {}, cost                 # a failed batch: caller opens everything
+            probs.update({start + i: v for i, v in p.items()})
+            cost += c_
+        return probs, cost
     shown = []
     for i, c in enumerate(hits):
         bl = (c.get("body") or "").splitlines()
@@ -1157,9 +1190,11 @@ def _jev_triage_hits(client, state: dict, hits: list[dict], around: int = 3):
             "type": "noul",
             "instructions": (f"Would reading the whole body of place [{i}] in `places` "
                              "help answer the `question`, given what is "
-                             "`already_established`? A test, an example or another "
+                            "`already_established`? A test, an example or another "
                              "platform's copy of the same function helps only if the "
-                             "question is about that. A build file, a configure "
+                             "question is about that. A translation or localisation "
+                             "catalog, or another derived copy of text that exists "
+                             "elsewhere in its original form, does not help. A build file, a configure "
                              "script or a configuration that names the file reached "
                              "from decides when that file is compiled or used; it "
                              "helps when the question asks under which conditions, "
@@ -1292,6 +1327,11 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
     max_add   = max_add or int(os.environ.get("JEV_EXPAND_MAX_ADD", "60"))
     max_chars = int(os.environ.get("JEV_EXPAND_MAX_CHARS", "250000"))
     max_hits  = int(os.environ.get("JEV_EXPAND_MAX_HITS", "25"))    # more hits = name is everywhere
+    # With the hit triage on, a common name is not dropped: every place is
+    # fetched and the triage picks the ones to open. max_hits then only
+    # applies when the triage is off.
+    triage_on = (os.environ.get("JEV_HIT_TRIAGE", "1") == "1"
+                 and os.environ.get("CHAIN_JUDGE", "jev") != "llm")
     max_defs  = int(os.environ.get("JEV_EXPAND_MAX_DEFS", "4"))
     per_node  = int(os.environ.get("JEV_EXPAND_PER_NODE", "30"))
     window    = int(os.environ.get("JEV_EXPAND_WINDOW", "10"))      # lines around a link
@@ -1316,7 +1356,9 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
             try:
                 grep_cache[name] = skills_lib.grep_code_ft(
                     org_redis, pattern=name, is_regex=False, file=None,
-                    struct_types=None, max_results=max_hits + 1,
+                    struct_types=None,
+                    max_results=(10 ** 6 if triage_on else max_hits + 1),
+                    exact_total=triage_on,
                     include_hist=as_of is not None, as_of=as_of,
                     rank_cache=_ranks)
             except Exception as e:
@@ -1329,8 +1371,10 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
 
     def _mentions(name: str, why: str) -> list[dict]:
         res = _grep(name)
-        if not res or res.get("total_matched", 0) > max_hits:
-            return []                          # the name is everywhere: it links nothing
+        if not res:
+            return []
+        if res.get("total_matched", 0) > max_hits and not triage_on:
+            return []          # no triage to choose among them: it links nothing
         out = []
         for r in res.get("rows", []):
             if r.get("post_range_body") or r.get("provenance_unresolved"):
@@ -1445,10 +1489,15 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                 # includers of a header (#include lines; the triage judges
                 # those well). Q3 log, 2026-11-01: 60 of 109 reverse reads
                 # were those two, with 1 accept among the includers.
+                got = _mentions(name, f"it mentions `{name}`")
+                if name == base and len(got) > max_hits:
+                    # reverse links skip the triage, so nothing would pick
+                    # among them: a file named in this many places links nothing
+                    got = []
                 out += [{**c, "reverse": (name == base
                                           and c.get("file") != n["file"]
                                           and not base.endswith(".h"))}
-                        for c in _mentions(name, f"it mentions `{name}`")]
+                        for c in got]
 
         # Names the judge chose to follow come first, and replace the blind
         # picks below. Seeds from the start selection have no such list.
@@ -1473,7 +1522,11 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                           if i < len(g)]
             else:
                 chosen = [c for g in groups for c in g]
-            # candidates handed in with the seed (composite members) go first
+            # candidates handed in with the seed (composite members) go first.
+            # With the triage on, every place of a chosen name goes through
+            # (the triage picks); per_node bounds only the blind picks.
+            if triage_on:
+                return list(n.get("extra") or []) + chosen + out[:per_node]
             return list(n.get("extra") or []) + (chosen + out)[:per_node]
 
         toks: list[str] = []
@@ -1551,7 +1604,11 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
     decisions: list[dict] = []
     by_key: dict = {}          # every candidate that was judged, by address
 
-    instructions = "Does this `code` help answer the `question`?"
+    instructions = ("Does this `code` help answer the `question`? A derived "
+                    "copy of text that exists elsewhere in the repository in "
+                    "its original form — a translation or localisation "
+                    "catalog, a mirrored or generated file — adds nothing the "
+                    "original does not and is a dead end.")
 
     def _link(c: dict) -> str:
         """The matching line of a candidate, with one line around it."""
@@ -1626,7 +1683,7 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
             per = [_candidates(n) for n in level]
             cands: list[dict] = []
             # one candidate per node in turn, so every node gets a share of the budget
-            for i in range(per_node):
+            for i in range(max((len(l) for l in per), default=0) if triage_on else per_node):
                 for n, lst in zip(level, per):
                     if i >= len(lst):
                         continue
@@ -1739,6 +1796,7 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                     raw_v, _p, c["cost"], picks = _jev_verdict_names(
                         client, state, instructions, _name_pool(org_redis, c))
                     c["verdict"] = _settle(raw_v, _p)
+                    c["verdict_raw"] = raw_v    # before _settle: a real continue vs an unsure reject
                     c["probs"], c["picks"] = _p, picks
                     # the names Jev said yes to are searched in the next hop
                     c["follow"], c["toks"] = _picked(picks), (0, 0)
@@ -1820,6 +1878,7 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                 "code": c["excerpt"],
             }), instructions)
             c["final"], c["final_probs"] = _settle(raw_v, _p), _p
+            c["final_raw"] = raw_v
 
         if again:
             with ThreadPoolExecutor(max_workers=judge_workers) as ex:
@@ -1849,6 +1908,29 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
             # sure reject: dropped. accept: attached. not sure: stays a lead.
             held = [c for c in held
                     if c.get("final") != "reject" and id(c) not in added_ids]
+
+        # A helper judged "continue" on its own body — a real continue, not
+        # an unsure reject — whose parent is evidence (a seed, or an accepted
+        # body) goes to the writer as well. Jev judged the body alone; the
+        # writer sees it next to its caller, which is where its meaning is.
+        # Q2, 2026-11-01: prepare_for_strict_sandbox() was read by Jev,
+        # "continue" twice, and reached the writer as a one-line lead only.
+        added_ids = {id(x) for x in added}
+        still_held = []
+        for c in held:
+            raw = c.get("final_raw") or c.get("verdict_raw")
+            p = c.get("parent") or {}
+            parent_is_evidence = "verdict" not in p or id(p) in added_ids
+            if (raw == "continue" and parent_is_evidence
+                    and len(added) < max_add and used <= max_chars):
+                used += len(c["excerpt"])
+                added.append(c)
+                added_ids.add(id(c))
+                print(f"🌱 helper of evidence: {c['file']} `{c['symbol']}` "
+                      f"({c['why']}) attached")
+            else:
+                still_held.append(c)
+        held = still_held
     finally:
         client.close()
 
