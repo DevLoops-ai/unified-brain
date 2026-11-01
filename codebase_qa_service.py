@@ -1241,6 +1241,19 @@ def _jev_verdict_names(client, state: dict, instructions: str,
     probabilities, cost, {name: probability of yes})."""
     questions = {"v": {"type": "choice", "instructions": instructions,
                        "criteria": _JEV_VERDICTS}}
+    # Asked apart from the verdict, so the wording does not colour it
+    # (run c put this in the verdict instruction; license-check.sh went
+    # from accepted to rejected, Q4 2026-11-01).
+    questions["derived"] = {
+        "type": "noul",
+        "instructions": ("Is this `code` a derived copy of text that exists "
+                         "elsewhere in the repository in its original form — "
+                         "a translation or localisation catalog, a mirrored "
+                         "or generated file — AND the `question` is not about "
+                         "that copy itself (its translations, how it is "
+                         "generated, what differs in it)? Answer no when the "
+                         "`question` asks about such copies."),
+    }
     as_choice = _names_as_choice() and bool(names)
     if as_choice:
         # One question: which name from `code` should be searched next?
@@ -1294,8 +1307,10 @@ def _jev_verdict_names(client, state: dict, instructions: str,
                     a = answers.get(f"n{i}") or {}
                     if a.get("noul") is not None:
                         picks[name] = float(a["noul"])
+            d = (answers.get("derived") or {}).get("noul")
             return (ans["choice"], ans.get("probabilities") or {},
-                    float((data.get("usage") or {}).get("cost") or 0), picks)
+                    float((data.get("usage") or {}).get("cost") or 0), picks,
+                    float(d) if d is not None else 0.0)
         print(f"⚠️  Jev verdict call failed: HTTP {res.status_code} "
               f"{_scrub(res.text[:200])}")
         return None, {}, 0.0, {}
@@ -1604,11 +1619,7 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
     decisions: list[dict] = []
     by_key: dict = {}          # every candidate that was judged, by address
 
-    instructions = ("Does this `code` help answer the `question`? A derived "
-                    "copy of text that exists elsewhere in the repository in "
-                    "its original form — a translation or localisation "
-                    "catalog, a mirrored or generated file — adds nothing the "
-                    "original does not and is a dead end.")
+    instructions = "Does this `code` help answer the `question`?"
 
     def _link(c: dict) -> str:
         """The matching line of a candidate, with one line around it."""
@@ -1645,7 +1656,7 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                 if not n.get("follow") or not n.get("body"):
                     continue
                 _ex, _cut = _excerpt(n["body"], n["hit"])
-                _v, _p, _c, picks = _jev_verdict_names(
+                _v, _p, _c, picks, _d = _jev_verdict_names(
                     client, {"question": question, "file": n["file"],
                              "symbol": n["symbol"], "code": _ex},
                     instructions, list(n["follow"]))
@@ -1784,25 +1795,41 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                         judge_target, question, c["chain"], c["why"],
                         c["file"], c["symbol"], c["excerpt"])
                 else:
+                    lk = _link(c)
                     state = _strip_desc({
                         "question": question,
                         "already_established": c["chain"],
                         "previous_steps": _prev_steps(c, body_cap),
-                        "reached_because": c["why"],
+                        "reached_because": c["why"] + (f"; line: `{lk}`" if lk else ""),
                         "file": c["file"], "symbol": c["symbol"],
                         "description": c.get("desc") or "",
                         "code": c["excerpt"],
                     })
-                    raw_v, _p, c["cost"], picks = _jev_verdict_names(
-                        client, state, instructions, _name_pool(org_redis, c))
+                    pool = _name_pool(org_redis, c)
+                    if not chains:
+                        # wide mode: every place of the name this body was
+                        # reached by is already in `seen`; offering it again
+                        # only takes share from the other names
+                        via = re.search(r"it (?:mentions|defines) `([^`]+)`",
+                                        c.get("why") or "")
+                        if via:
+                            pool = [t for t in pool if t != via.group(1)]
+                    raw_v, _p, c["cost"], picks, derived = _jev_verdict_names(
+                        client, state, instructions, pool)
                     c["verdict"] = _settle(raw_v, _p)
                     c["verdict_raw"] = raw_v    # before _settle: a real continue vs an unsure reject
+                    c["derived"] = derived
+                    if derived > 0.5:
+                        # Jev says this body is a copy of text that exists
+                        # elsewhere: a dead end, whatever the verdict said
+                        c["verdict"] = c["verdict_raw"] = "reject"
                     c["probs"], c["picks"] = _p, picks
                     # the names Jev said yes to are searched in the next hop
                     c["follow"], c["toks"] = _picked(picks), (0, 0)
                     c["reason"] = (_fmt_probs(_p)
                                    + (" (not sure: continue)"
                                       if raw_v != c["verdict"] else "")
+                                   + f" derived={derived:.2f}"
                                    + _fmt_picks(picks))
 
             with ThreadPoolExecutor(max_workers=judge_workers) as ex:
