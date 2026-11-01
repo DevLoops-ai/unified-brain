@@ -2,7 +2,7 @@
 
 **Persistent memory for System One coding agents, by [DevLoops](https://devloops.ai).**
 
-On 24/10/2026 I have published as OSS a framework I call unified-brain: evidence gathering that is fast and cheap, and close to a frontier coding agent in accuracy. On the same nine-question, 74-point xz benchmark (`evals/xz.md`) it scored 86.5 % against 94.6 % for a Claude Opus 5.5 agent and 93.2 % for a Claude Fable 5.1 agent, at 1/10 and 1/26 of their cost (prompt caching on), 2–3× faster, with zero wrong claims. The gathering is done by Jev, a small judge model, not by the frontier model.
+On 24/10/2026 I have published as OSS a framework I call unified-brain: evidence gathering that is fast and cheap, and as accurate as a frontier coding agent. On the same nine-question, 74-point xz benchmark (`evals/questions/xz.md`) it scores 93.2 % — the same as a Claude Fable 5.1 agent, against 94.6 % for a Claude Opus 5.5 agent — at 1/8 and 1/20 of their cost (prompt caching on), 2.4–3.5× faster. It started at 86.5 % on 29/10; the four retrieval changes that closed the gap are each written up in `evals/results/`. The gathering is done by Jev, a frontier decision judge model, not by the frontier model.
 
 The magic sauce is an intermediary OS (SQLITE) memory layer that facilitates retrieval, filtering and judging through a System One model, namely Jev.
 
@@ -10,7 +10,7 @@ The agent spawned from unified-brain runs through MCP on Cursor, OpenCode or Cla
 
 > So to be clear here: unified-brain is not a harness but a perception layer any harness plugs in!
 
-The benchmarks on two large OS libraries (xz and open62541, in `evals/` on this repo) are close enough to the frontier agents, at a fraction of their cost, that I believe this is a missing link to make AI more reliable.
+The evals on two large OS libraries (xz and open62541, in `evals/` on this repo) are close enough to the frontier agents, at a fraction of their cost, that I believe this is a missing link to make AI more reliable.
 
 This is because the limits holding back AI are:
 
@@ -18,7 +18,7 @@ This is because the limits holding back AI are:
 
 The LLM turn reasoning it is introducing uncertainty and probabilistic outcomes.
 
-BUT.. Unified-brain's System One discovery engine breaks the task into hundreds of yes-or-no calls, so the search itself does not reason in prose and cannot hallucinate a path. In the graded xz set the answers contained zero wrong claims in the cheap configuration and one in the expensive one (a writer slip, not a retrieval error). Replicability across runs has not been measured yet: one run per question so far.
+BUT.. Unified-brain's System One discovery engine breaks the task into hundreds of yes-or-no calls, so the search itself does not reason in prose and cannot hallucinate a path. Across five graded xz runs the answers contained one wrong claim per run at most, always the same one on the longest answer — a constant misquoted by the writer with the right value in its evidence; never a retrieval error. Replicability across runs has not been conclusively measured yet.
 
 - **Context Loss and Memory Limits**:
 
@@ -139,7 +139,7 @@ LLM_PROVIDER=llmbase
 LLM_API_KEY=...
 # Jev, through OpenRouter
 OPENROUTER_API_KEY=...
-# code embeddings: qwen (the benchmarks), or voyage (then set VOYAGE_API_KEY instead)
+# code embeddings: qwen (the evals), or voyage (then set VOYAGE_API_KEY instead)
 CODE_EMBED_PASS2=qwen
 QA_VECTOR_STORE=qwen
 DEEPINFRA_API_KEY=...
@@ -272,12 +272,15 @@ Measured with the configuration in Part 1 of `env.example`:
 - Vague questions ("what is this library for?") are cheaper on Jev.
 - One comparison so far, same question, same Cursor model, caches cold:
   Cursor exploring on its own used 9% of a $20 plan; with unified-brain
-  2% plus $0.12 of Jev. The answers are in `benchmarks/`.
+  2% plus $0.12 of Jev. The question set is `/evals`;
+  the Cursor answers themselves are not in the repo.
 - Nine xz questions, 74 reference points, against Claude Opus 5.5 and
   Fable 5.1 agents with shell access (one run each, prompt caching on):
-  unified-brain 64 / 74 at $0.685 and 591 s; Opus 70 / 74 at $6.84 and
-  1,183 s; Fable 69 / 74 at $17.55 and 1,736 s. Grader: Fable 5.1, with
-  the keys fixed before the runs. Details in `evals/xz.md`.
+  unified-brain 69 / 74 at $0.874 and 498 s (run d, 2026-11-01; the
+  first run on 2026-10-29 was 64 / 74 at $0.685); Opus 70 / 74 at $6.84
+  and 1,183 s; Fable 69 / 74 at $17.55 and 1,736 s. Grader: Fable 5.1,
+  with the keys fixed before the runs. Questions and keys in
+  `evals/questions/xz.md`, one dated file per run in `evals/results/`.
 
 Each answer ends with a line of these numbers for your own run. Part 2 of
 `env.example` lists the constants that move them; the ones we tested are

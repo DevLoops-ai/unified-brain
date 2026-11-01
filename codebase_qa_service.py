@@ -1339,7 +1339,7 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
     Returns (extra skills in _search_skills shape, info)."""
     min_score = float(os.environ.get("JEV_EXPAND_MIN_SCORE", "2.0"))
     budget    = budget or int(os.environ.get("JEV_EXPAND_BUDGET", "300"))     # Jev calls
-    max_add   = max_add or int(os.environ.get("JEV_EXPAND_MAX_ADD", "60"))
+    max_add   = max_add or int(os.environ.get("JEV_EXPAND_MAX_ADD", "200"))
     max_chars = int(os.environ.get("JEV_EXPAND_MAX_CHARS", "250000"))
     max_hits  = int(os.environ.get("JEV_EXPAND_MAX_HITS", "25"))    # more hits = name is everywhere
     # With the hit triage on, a common name is not dropped: every place is
@@ -1819,7 +1819,7 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                     c["verdict"] = _settle(raw_v, _p)
                     c["verdict_raw"] = raw_v    # before _settle: a real continue vs an unsure reject
                     c["derived"] = derived
-                    if derived > 0.5:
+                    if derived > float(os.environ.get("JEV_DERIVED_MIN", "0.5")):
                         # Jev says this body is a copy of text that exists
                         # elsewhere: a dead end, whatever the verdict said
                         c["verdict"] = c["verdict_raw"] = "reject"
