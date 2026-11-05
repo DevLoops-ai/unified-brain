@@ -464,27 +464,75 @@ def _knn_candidates(question, org_redis_binary, *, embedding, top_k,
 
 
 
+def _is_whole_file(s: dict) -> bool:
+    return (s.get("symbol") or s.get("name") or "").startswith("<")
 
 
+def _jev_label(s: dict) -> str:
+    """How Jev rated this body, for the writer: a seed's score (the first
+    pass, 0–4) or a chain body's accept probability and final look."""
+    j = s.get("jev")
+    if not j:
+        return f"Jev score: {s['score']} of 4"
+    lab = f"Jev accept: {j['accept']:.2f}"
+    if j.get("final") is not None:
+        lab += f", final look {j['final']:.2f}"
+    if j.get("verdict"):
+        lab += f", {j['verdict']}"
+    return lab
 
 
+def _writer_rank(s: dict) -> tuple:
+    """Seeds before chain bodies, higher Jev number first."""
+    if s.get("jev"):
+        return (0, float(s["jev"]["accept"]))
+    return (1, float(s["score"] or 0))
 
 
+def _order_for_writer(skills: list[dict]) -> list[dict]:
+    """One file's bodies together, the whole-file body first, then seeds,
+    then chain bodies, higher Jev number first; files in the order of their
+    best body. Before this the writer got the seeds by score and then every
+    chain body in the order it was reached, so one file's pieces were
+    scattered across the whole context (test_lzip_decoder.c: fourteen
+    pieces among 99 bodies, run e Q4)."""
+    by_file: dict[str, list[dict]] = {}
+    for s in skills:
+        by_file.setdefault(s.get("file_path") or "", []).append(s)
+    files = sorted(by_file,
+                   key=lambda f: max(_writer_rank(s) for s in by_file[f]),
+                   reverse=True)
+    out: list[dict] = []
+    for f in files:
+        out += sorted(by_file[f],
+                      key=lambda s: (not _is_whole_file(s),) + tuple(-x for x in _writer_rank(s)))
+    return out
 
 
-
-
+def _evidence_index(skills: list[dict]) -> str:
+    """One line per body, in the order the bodies follow: the shape of the
+    evidence before its 200–400 k characters."""
+    lines = [f"### Evidence index — {len(skills)} bodies, grouped by file; "
+             "the number is the body's heading below",
+             "Every body here was read and kept by the judge. Its number is "
+             "the judge's view of the body on its own, not of the facts in it."]
+    for i, s in enumerate(skills, 1):
+        how = (s.get("jev") or {}).get("how") or "matched the question directly"
+        lines.append(f"{i}. {s.get('file_path') or '?'} · "
+                     f"`{s.get('symbol') or s['name']}` · {_jev_label(s)} · {how}")
+    return "\n".join(lines)
 
 
 def _build_context(skills: list[dict], shown_bodies: Optional[dict] = None) -> str:
-    parts = []
+    skills = _order_for_writer(skills)
+    parts = [_evidence_index(skills)] if len(skills) > 1 else []
     for i, s in enumerate(skills, 1):
         tag = " [PLANNED — not yet implemented]" if s["suggested"] else ""
         if s.get("is_obsolete"):
             tag += " [OBSOLETE at current HEAD — existed at the probed commit]"
         if s.get("reconstructed"):
             tag += " [STATE RECONSTRUCTED as of the probed range — later revisions hidden]"
-        header = f"### {i}. {s['name']}{tag} (relevance: {s['score']})"
+        header = f"### {i}. {s['name']}{tag} ({_jev_label(s)})"
         if s["file_path"]:
             header += f"\nFile: {s['file_path']}"
         if s.get("guard"):
@@ -973,6 +1021,18 @@ def _settle(verdict, probs):
         return "continue"
     return verdict
 
+
+def _just_over(p, cut: float) -> bool:
+    """A judgement that fell on the strict side of `cut`, but within
+    JEV_RETRY_BAND of it. Jev's probabilities move 1–7 points between
+    identical calls (Q9, 2026-11-02: two runs, same bodies), so a body this
+    close to the line is a coin flip. Such a judgement is asked once more
+    and the more permissive answer is kept: every flip seen so far dropped
+    a true positive (test_memlimit_stream_decoder, license-check.sh,
+    coder_normal); none let a wrong body in. 0 disables the retry."""
+    band = float(os.environ.get("JEV_RETRY_BAND", "0.10"))
+    return p is not None and band > 0 and cut <= float(p) < cut + band
+
 def _no_desc() -> bool:
     """TEST (JEV_NO_DESC=1): the Jev path runs without the stored
     LLM descriptions."""
@@ -1347,6 +1407,9 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
     # applies when the triage is off.
     triage_on = (os.environ.get("JEV_HIT_TRIAGE", "1") == "1"
                  and os.environ.get("CHAIN_JUDGE", "jev") != "llm")
+    # Groups of fewer places than this are read in full; from this size
+    # on, the triage picks. 2 = every group (the behaviour so far).
+    triage_from = int(os.environ.get("JEV_TRIAGE_FROM", "2"))
     max_defs  = int(os.environ.get("JEV_EXPAND_MAX_DEFS", "4"))
     per_node  = int(os.environ.get("JEV_EXPAND_PER_NODE", "30"))
     window    = int(os.environ.get("JEV_EXPAND_WINDOW", "10"))      # lines around a link
@@ -1444,6 +1507,39 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                               "struct": p[3], "body": body})
         return found
 
+    _file_index: dict[str, list[str]] = {}
+
+    def _file_places(name: str) -> list[dict]:
+        """Whole-file bodies of the files whose basename or stem is `name`.
+        A followed file name must reach the file itself, not only the
+        bodies that mention it (`test_compress` -> tests/test_compress.sh;
+        the mention grep finds the wrappers and never the script).
+        Current state only; a windowed read keeps the mention path."""
+        if want is not None or as_of is not None or len(name) < 4:
+            return []
+        if not _file_index:
+            for sym in ("<module>", "<blob>"):
+                for sk in _decode_set(org_redis.smembers(f"symbol_name:{sym}")):
+                    p = skills_lib.parse_def_key(sk[len("symbol:"):])
+                    if p:
+                        b = os.path.basename(p[0])
+                        for k in {b, os.path.splitext(b)[0]}:
+                            _file_index.setdefault(k, []).append(sk)
+        keys = _file_index.get(name, [])
+        if len(keys) > max_hits:
+            return []          # a file name used this often is "everywhere", as in _mentions
+        out = []
+        for sk in keys:
+            dk = sk[len("symbol:"):]
+            p = skills_lib.parse_def_key(dk)
+            body = skills_lib.get_code(org_redis, dk) if p else ""
+            if body:
+                out.append({"file": p[0], "symbol": p[1], "line": int(p[2]),
+                            "struct": p[3], "body": body, "hit": None,
+                            "why": f"it is the file named `{name}`, "
+                                   "which the judge chose to follow"})
+        return out
+
     def _candidates(n: dict) -> list[dict]:
         body = n["body"] or ""
         lines = body.splitlines()
@@ -1466,8 +1562,8 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
             for name in list(n["follow"])[:need * 3]:
                 if len(picked) >= need:
                     break
-                got = _mentions(name, f"it mentions `{name}`, a name the "
-                                      "judge chose to follow")
+                got = _file_places(name) + _mentions(
+                    name, f"it mentions `{name}`, a name the judge chose to follow")
                 if not got:
                     got = [{**d, "hit": None,
                             "why": f"it defines `{name}`, a name the "
@@ -1519,8 +1615,8 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
         if n.get("follow") is not None:
             groups: list[list[dict]] = []
             for name in n["follow"]:
-                got = _mentions(name, f"it mentions `{name}`, a name the "
-                                      "judge chose to follow")
+                got = _file_places(name) + _mentions(
+                    name, f"it mentions `{name}`, a name the judge chose to follow")
                 if not got:
                     # too many mentions to follow: take its definitions
                     got = [{**d, "hit": None,
@@ -1736,21 +1832,39 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                     m = re.search(r"it mentions `([^`]+)`", c.get("why") or "")
                     if m and c.get("hit") is not None:
                         groups.setdefault((id(c["parent"]), m.group(1)), []).append(c)
-                work = [(k, g) for k, g in groups.items() if len(g) >= 2]
+                work = [(k, g) for k, g in groups.items() if len(g) >= triage_from]
                 dropped: set = set()
 
                 def _triage(item):
                     (_pid, name), g = item
                     n = g[0]["parent"]
-                    probs, c_ = _jev_triage_hits(client, _strip_desc({
+                    st = _strip_desc({
                         "question": question,
                         "already_established": n["chain"],
                         "reached_from": f"`{n['symbol']}` in {n['file']}",
                         "following_name": name,
-                    }), g)
+                    })
+                    probs, c_ = _jev_triage_hits(client, st, g)
                     if not probs:
                         return name, len(g), 0, c_, n.get("root_i")
                     cut = float(os.environ.get("JEV_FOLLOW_MIN", "0.5"))
+                    # places dropped by a hair are asked once more; a place
+                    # is kept if either call keeps it (the strict side of
+                    # this cut is "below", so the band is mirrored)
+                    band = float(os.environ.get("JEV_RETRY_BAND", "0.10"))
+                    near = [i for i, p in probs.items()
+                            if band > 0 and cut - band <= p < cut]
+                    if near:
+                        p2, c2 = _jev_triage_hits(client, st, [g[i] for i in near], around=3)
+                        c_ += c2
+                        moved = []
+                        for j, i in enumerate(near):
+                            if p2.get(j) is not None and p2[j] > probs[i]:
+                                moved.append(f"{probs[i]:.2f}→{p2[j]:.2f}")
+                                probs[i] = p2[j]
+                        print(f"🔁 triage retry `{name}`: {len(near)} near the cut, "
+                              f"{sum(1 for i in near if probs[i] >= cut)} rescued"
+                              + (" (" + ", ".join(moved) + ")" if moved else ""))
                     skipped = 0
                     for i, c in enumerate(g):
                         c["triage_p"] = probs.get(i)
@@ -1816,10 +1930,30 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                             pool = [t for t in pool if t != via.group(1)]
                     raw_v, _p, c["cost"], picks, derived = _jev_verdict_names(
                         client, state, instructions, pool)
+                    sure = float(os.environ.get("JEV_SURE_REJECT", "0.75"))
+                    dmin = float(os.environ.get("JEV_DERIVED_MIN", "0.65"))
+                    retry = ""
+                    if ((raw_v == "reject" and _just_over(_p.get("reject"), sure))
+                            or _just_over(derived, dmin)):
+                        # a sure reject or a derived-copy call by a hair:
+                        # ask once more, keep the more permissive answer
+                        # (lower reject, lower derived); the names stay
+                        # from the first call
+                        raw2, p2, cost2, _picks2, derived2 = _jev_verdict_names(
+                            client, state, instructions, pool)
+                        c["cost"] += cost2
+                        if raw2 is not None:
+                            retry = (f" retry: reject {float(_p.get('reject', 0)):.2f}"
+                                     f"→{float(p2.get('reject', 0)):.2f}"
+                                     f" derived {derived:.2f}→{derived2:.2f}")
+                            if float(p2.get("reject", 0)) < float(_p.get("reject", 0)):
+                                raw_v, _p = raw2, p2
+                            derived = min(derived, derived2)
+                    c["retry"] = retry.strip()
                     c["verdict"] = _settle(raw_v, _p)
                     c["verdict_raw"] = raw_v    # before _settle: a real continue vs an unsure reject
                     c["derived"] = derived
-                    if derived > float(os.environ.get("JEV_DERIVED_MIN", "0.5")):
+                    if derived > dmin:
                         # Jev says this body is a copy of text that exists
                         # elsewhere: a dead end, whatever the verdict said
                         c["verdict"] = c["verdict_raw"] = "reject"
@@ -1830,6 +1964,7 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                                    + (" (not sure: continue)"
                                       if raw_v != c["verdict"] else "")
                                    + f" derived={derived:.2f}"
+                                   + retry
                                    + _fmt_picks(picks))
 
             with ThreadPoolExecutor(max_workers=judge_workers) as ex:
@@ -1860,6 +1995,7 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                                  if c.get("verdict") in ("accept", "continue")
                                  else []),
                     "reason": "" if c.get("probs") else (c.get("reason") or ""),
+                    "retry": c.get("retry") or "",
                     "chars": len(c.get("excerpt") or ""),
                     "excerpt": bool(c.get("cut"))})
 
@@ -1894,7 +2030,7 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                    if o.get("verdict") in ("accept", "continue")]
             c["led_n"] = len(led)
             prev_txt = _prev_steps(c, body_cap)
-            raw_v, _p, c["cost"] = _jev_verdict(client, _strip_desc({
+            st = _strip_desc({
                 "question": question,
                 "already_established": c["chain"],
                 "previous_steps": prev_txt,
@@ -1903,7 +2039,21 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                 "file": c["file"], "symbol": c["symbol"],
                 "description": c.get("desc") or "",
                 "code": c["excerpt"],
-            }), instructions)
+            })
+            raw_v, _p, c["cost"] = _jev_verdict(client, st, instructions)
+            sure = float(os.environ.get("JEV_SURE_REJECT", "0.75"))
+            c["final_retry"] = ""
+            if raw_v == "reject" and _just_over(_p.get("reject"), sure):
+                # a sure reject by a hair drops the lead for good: ask once
+                # more, keep the call with the lower reject
+                st["led_to"] = st["led_to"]      # same state, second opinion
+                raw2, p2, cost2 = _jev_verdict(client, st, instructions)
+                c["cost"] += cost2
+                if raw2 is not None:
+                    c["final_retry"] = (f"retry: reject {float(_p.get('reject', 0)):.2f}"
+                                        f"→{float(p2.get('reject', 0)):.2f}")
+                    if float(p2.get("reject", 0)) < float(_p.get("reject", 0)):
+                        raw_v, _p = raw2, p2
             c["final"], c["final_probs"] = _settle(raw_v, _p), _p
             c["final_raw"] = raw_v
 
@@ -1919,12 +2069,14 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
             for c in again:
                 print(f"🌱 final: {c.get('final')} {c['file']} "
                       f"`{c['symbol']}` led_to={c.get('led_n')} "
-                      f"— {_fmt_probs(c.get('final_probs'))}")
+                      f"— {_fmt_probs(c.get('final_probs'))}"
+                      + (f" {c['final_retry']}" if c.get("final_retry") else ""))
                 decisions.append({
                     "kind": "second_look", "step": hops,
                     "file": c["file"], "symbol": c["symbol"],
                     "led_to": c.get("led_n", 0),
                     "verdict": c.get("final") or "",
+                    "retry": c.get("final_retry") or "",
                     "probs": {k: round(float(v), 2)
                               for k, v in (c.get("final_probs") or {}).items()}})
                 if (c.get("final") == "accept" and len(added) < max_add
@@ -1975,6 +2127,13 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                 sid = ids[-1].decode() if isinstance(ids[-1], bytes) else ids[-1]
         except Exception:
             pass
+        # Jev's judgement of this body, for the writer's context and the
+        # sources list. Chain bodies used to carry a placeholder score of
+        # 1.0, which labelled a body accepted at 0.93 below the weakest seed
+        # (2.0); the facts the writer skipped sat in exactly those bodies
+        # (run e, 2026-11-05).
+        _pa = float((c.get("probs") or {}).get("accept", 0) or 0)
+        _pf = (c.get("final_probs") or {}).get("accept")
         out.append({
             "skill_id":      sid,
             "name":          sid or f"{c['symbol']} ({c['file']})",
@@ -1986,7 +2145,11 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
             "reconstructed": False,
             "code":          code,
             "guard":         guard,
-            "score":         1.0,
+            "score":         round(_pa, 3),
+            "jev":           {"accept": round(_pa, 2),
+                              "final": round(float(_pf), 2) if _pf is not None else None,
+                              "verdict": c.get("final") or c.get("verdict") or "",
+                              "how": c.get("why") or ""},
             "is_composite":  False,
             # for the evidence record: how it was reached, and which body it was
             "trail":         list(c["trail"]),
