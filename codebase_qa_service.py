@@ -1451,8 +1451,8 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
         res = _grep(name)
         if not res:
             return []
-        if res.get("total_matched", 0) > max_hits and not triage_on:
-            return []          # no triage to choose among them: it links nothing
+        if res.get("total_matched", 0) > max_hits:
+            return []          # a name found in this many places links nothing
         out = []
         for r in res.get("rows", []):
             if r.get("post_range_body") or r.get("provenance_unresolved"):
