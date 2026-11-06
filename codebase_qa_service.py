@@ -1092,11 +1092,14 @@ def _prev_steps(c: dict, cap: int) -> str:
     is given as the part around its link line."""
     if not _no_desc():
         return "\n".join(f"- {lab}: {d}" for lab, d in c["prev"])
-    room = cap - len(c.get("excerpt") or "")
+    _prev_cap = os.environ.get("JEV_PREV_MAX_CHARS")
+    room = (int(_prev_cap) if _prev_cap
+            else cap - len(c.get("excerpt") or ""))
     parts: list[str] = []
     for label, body, hit in reversed(c.get("prev_code") or []):
         head = f"### {label}\n"
-        left = room - len(head) - 80
+        left = min(room - len(head) - 80,
+                   int(os.environ.get("JEV_PREV_BODY_MAX_CHARS", str(cap))))
         if left < 500:
             break                      # the room is used up
         piece, cut = _jev_excerpt(body, hit, left)
@@ -1451,6 +1454,11 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
     triage_from = int(os.environ.get("JEV_TRIAGE_FROM", "2"))
     max_defs  = int(os.environ.get("JEV_EXPAND_MAX_DEFS", "4"))
     per_node  = int(os.environ.get("JEV_EXPAND_PER_NODE", "30"))
+    # JEV_TRIAGE_DEFS=1: the definitions a body uses are not read whole in
+    # text order and cut at per_node; all of them go through one triage
+    # call per body (signature and first lines of each), the judge says per
+    # definition whether to open it, and reads follow highest probability first.
+    triage_defs = triage_on and os.environ.get("JEV_TRIAGE_DEFS", "0") == "1"
     window    = int(os.environ.get("JEV_EXPAND_WINDOW", "10"))      # lines around a link
     body_cap  = int(os.environ.get("JEV_BODY_MAX_CHARS", "60000"))
     t0 = time.time()
@@ -1683,6 +1691,8 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
             # candidates handed in with the seed (composite members) go first.
             # With the triage on, every place of a chosen name goes through
             # (the triage picks); per_node bounds only the blind picks.
+            if triage_defs:
+                return list(n.get("extra") or []) + chosen + out
             if triage_on:
                 return list(n.get("extra") or []) + chosen + out[:per_node]
             return list(n.get("extra") or []) + (chosen + out)[:per_node]
@@ -1711,7 +1721,7 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
         # Looked up 16 at a time, and only until this node's list is full.
         wanted = [t for t, c in zip(toks, counts) if 1 <= c <= max_defs]
         i = 0
-        while want is None and i < len(wanted) and len(out) < per_node:
+        while want is None and i < len(wanted) and (triage_defs or len(out) < per_node):
             chunk = wanted[i:i + 16]
             i += 16
             with ThreadPoolExecutor(max_workers=len(chunk)) as ex:
@@ -1720,7 +1730,7 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                 for d in defs:
                     out.append({**d, "hit": None,
                                 "why": f"it defines `{t}`, which is used there"})
-        return out[:per_node]
+        return out if triage_defs else out[:per_node]
 
     def _excerpt(body: str, hit: Optional[int]) -> tuple[str, bool]:
         return _jev_excerpt(body, hit, body_cap)
@@ -1923,6 +1933,9 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                     m = re.search(r"it mentions `([^`]+)`", c.get("why") or "")
                     if m and c.get("hit") is not None:
                         groups.setdefault((id(c["parent"]), m.group(1)), []).append(c)
+                    elif triage_defs and (c.get("why") or "").startswith("it defines `"):
+                        # every definition this body uses, judged in one call
+                        groups.setdefault((id(c["parent"]), "(definitions)"), []).append(c)
                 work = [(k, g) for k, g in groups.items() if len(g) >= triage_from]
                 dropped: set = set()
 
@@ -1933,7 +1946,9 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                         "question": question,
                         "already_established": n["chain"],
                         "reached_from": f"`{n['symbol']}` in {n['file']}",
-                        "following_name": name,
+                        "following_name": (name if name != "(definitions)" else
+                                           "the names this body uses; each place "
+                                           "below defines one of them"),
                     })
                     probs, c_ = _jev_triage_hits(client, st, g)
                     if not probs:
@@ -1980,6 +1995,10 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                                           "skipped": skipped})
                     before = len(cands)
                     cands = [c for c in cands if id(c) not in dropped]
+                    if triage_defs:
+                        # highest triage probability first; untriaged places keep their rank
+                        cands.sort(key=lambda c: -(c["triage_p"]
+                                                   if c.get("triage_p") is not None else 1.0))
                     print(f"🔎 triage hop {hops + 1}: {before} candidates → {len(cands)} "
                           f"to read ({len(work)} triage calls)")
 

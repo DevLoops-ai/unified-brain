@@ -2069,19 +2069,11 @@ class GitDiffIngester:
         if parent:
             out = self.git('diff', '--no-renames', '--name-only',
                            f'--diff-filter={diff_filter}', parent, h)
-            # Merge: the branch side was indexed against its own parents.
-            # Whatever the merge dropped or overrode from that side is only
-            # visible against the second parent.
-            parent2 = self.parent_hash(h, 2)
-            if parent2:
-                out += '\n' + self.git('diff', '--no-renames', '--name-only',
-                                       f'--diff-filter={diff_filter}', parent2, h)
         else:
             out = self.git('diff-tree', '--root', '--no-commit-id', '-r',
                            '--name-only', f'--diff-filter={diff_filter}', h)
-        seen = set()
         return [f for f in (l.strip() for l in out.split('\n'))
-                if f and is_ingestable(f) and not (f in seen or seen.add(f))]
+                if f and is_ingestable(f)]
 
     def changed_files(self, h):
         return self._diff_names(h, 'ACMR')
@@ -2101,9 +2093,9 @@ class GitDiffIngester:
             return None
         return data.decode('utf-8', 'replace')
 
-    def parent_hash(self, h, n=1):
+    def parent_hash(self, h):
         try:
-            return self.git('rev-parse', f'{h}^{n}')
+            return self.git('rev-parse', f'{h}^')
         except Exception:
             return None
 
