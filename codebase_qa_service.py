@@ -518,13 +518,28 @@ def _evidence_index(skills: list[dict]) -> str:
              "the judge's view of the body on its own, not of the facts in it."]
     for i, s in enumerate(skills, 1):
         how = (s.get("jev") or {}).get("how") or "matched the question directly"
+        also = s.get("also") or []
         lines.append(f"{i}. {s.get('file_path') or '?'} · "
-                     f"`{s.get('symbol') or s['name']}` · {_jev_label(s)} · {how}")
+                     f"`{s.get('symbol') or s['name']}` · {_jev_label(s)} · {how}"
+                     + (f" · same text also at {', '.join(also)}" if also else ""))
     return "\n".join(lines)
 
 
 def _build_context(skills: list[dict], shown_bodies: Optional[dict] = None) -> str:
-    skills = _order_for_writer(skills)
+    # identical text once: the first copy stays, the others become a note on it
+    firsts: dict[str, dict] = {}
+    kept: list[dict] = []
+    for s in skills:
+        h = hashlib.sha1((s.get("code") or "").encode("utf-8", "replace")).hexdigest()
+        if s.get("code") and h in firsts:
+            firsts[h].setdefault("also", []).append(
+                f"{s.get('file_path') or '?'}:{s.get('symbol') or s['name']}")
+            continue
+        firsts[h] = s
+        kept.append(s)
+    if len(kept) < len(skills):
+        print(f"✍️  context: {len(skills) - len(kept)} duplicate bod(ies) folded")
+    skills = _order_for_writer(kept)
     parts = [_evidence_index(skills)] if len(skills) > 1 else []
     for i, s in enumerate(skills, 1):
         tag = " [PLANNED — not yet implemented]" if s["suggested"] else ""
@@ -830,15 +845,36 @@ def _jev_select(question: str, org_redis,
                 c.pop("err", None)
                 c["score"] = float(ans["score"])
                 c["cost"] = float((data.get("usage") or {}).get("cost") or 0)
+                if not globals().get("_usage_shown"):
+                    globals()["_usage_shown"] = True
+                    print(f"🧾 judge usage (one sample): {data.get('usage')}")
             else:
                 c["err"] = f"HTTP {res.status_code} {res.text[:200]}"
             return
 
+    # One judge call per distinct body text; identical text gets the same
+    # score and one copy in the context (Q7 2026-11-06: ua_subscription.h
+    # `UA_MonitoredItem` five times at 2.00, five calls, five copies).
+    by_text: dict[str, list[dict]] = {}
+    for c in cands:
+        h = hashlib.sha1(c["body"].encode("utf-8", "replace")).hexdigest()
+        by_text.setdefault(h, []).append(c)
+    firsts = [g[0] for g in by_text.values()]
+    also_map = {g[0]["dk"]: [c["dk"] for c in g[1:]]
+                for g in by_text.values() if len(g) > 1}
     try:
         with ThreadPoolExecutor(max_workers=workers) as ex:
-            list(ex.map(_score, cands))
+            list(ex.map(_score, firsts))
     finally:
         client.close()
+    for g in by_text.values():
+        for c in g[1:]:
+            c["score"], c["cost"], c["dup_of"] = g[0]["score"], 0.0, g[0]["dk"]
+            if g[0].get("err"):
+                c["err"] = g[0]["err"]
+    if len(firsts) < len(cands):
+        print(f"🎯 Jev select: {len(cands)} candidates, {len(firsts)} distinct bodies "
+              f"({len(cands) - len(firsts)} duplicates scored once)")
 
     scored = [c for c in cands if c["score"] is not None]
     _errs = [c["err"] for c in cands if c.get("err")]
@@ -851,6 +887,8 @@ def _jev_select(question: str, org_redis,
     for c in above:
         if len(out) >= max_skills or used > max_chars:
             break
+        if c.get("dup_of"):
+            continue                     # same text as a seed already kept
         guard, code = _sg(c["body"]) if _sg else ("", c["body"])
         used += len(code)
         out.append({
@@ -868,6 +906,7 @@ def _jev_select(question: str, org_redis,
             "guard":         guard,
             "score":         round(c["score"], 2),
             "is_composite":  False,
+            "also":          also_map.get(c["dk"], []),
         })
     info = {
         "candidates": len(cands), "scored": len(scored),
@@ -1562,13 +1601,20 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
             for name in list(n["follow"])[:need * 3]:
                 if len(picked) >= need:
                     break
-                got = _file_places(name) + _mentions(
-                    name, f"it mentions `{name}`, a name the judge chose to follow")
-                if not got:
-                    got = [{**d, "hit": None,
-                            "why": f"it defines `{name}`, a name the "
-                                   "judge chose to follow"}
-                           for d in _defs(name)]
+                # The definition of a chosen name is read in full, never
+                # triaged: its body names itself in the signature, so the
+                # grep returns it as a "mention" and the triage judged it
+                # from three lines around the signature (Q8: addNode_finish
+                # followed at 0.42, then "7 places, 7 skipped").
+                defs = [{**d, "hit": None,
+                         "why": f"it defines `{name}`, a name the "
+                                "judge chose to follow"}
+                        for d in _defs(name)]
+                dkeys = {(d["file"], d["symbol"], d["line"]) for d in defs}
+                got = defs + _file_places(name) + [
+                    c for c in _mentions(
+                        name, f"it mentions `{name}`, a name the judge chose to follow")
+                    if (c["file"], c["symbol"], c["line"]) not in dkeys]
                 took = None
                 for c in got:
                     k = (c["file"], c["symbol"], c["line"])
@@ -1615,14 +1661,15 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
         if n.get("follow") is not None:
             groups: list[list[dict]] = []
             for name in n["follow"]:
-                got = _file_places(name) + _mentions(
-                    name, f"it mentions `{name}`, a name the judge chose to follow")
-                if not got:
-                    # too many mentions to follow: take its definitions
-                    got = [{**d, "hit": None,
-                            "why": f"it defines `{name}`, a name the "
-                                   "judge chose to follow"}
-                           for d in _defs(name)]
+                defs = [{**d, "hit": None,
+                         "why": f"it defines `{name}`, a name the "
+                                "judge chose to follow"}
+                        for d in _defs(name)]
+                dkeys = {(d["file"], d["symbol"], d["line"]) for d in defs}
+                got = defs + _file_places(name) + [
+                    c for c in _mentions(
+                        name, f"it mentions `{name}`, a name the judge chose to follow")
+                    if (c["file"], c["symbol"], c["line"]) not in dkeys]
                 if got:
                     groups.append(got)
             if spread:
@@ -1731,7 +1778,7 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
         limits=httpx.Limits(max_connections=256, max_keepalive_connections=256),
         headers={"Authorization":
                  f"Bearer {os.environ.get('OPENROUTER_API_KEY', '')}"})
-    max_hops = int(os.environ.get("JEV_EXPAND_MAX_HOPS", "4"))
+    max_hops = int(os.environ.get("JEV_EXPAND_MAX_HOPS", "5"))
     judge_target = memory.target if memory is not None else None
     use_llm_judge = os.environ.get("CHAIN_JUDGE", "jev") == "llm"
     # Jev takes hundreds of calls at once; the LLM judge keeps the low limit
@@ -1774,6 +1821,50 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                 print(f"🌱 chain start `{n['symbol']}`: {len(picks)} names "
                       f"scored, first {chains} start a chain —"
                       + _fmt_picks(picks))
+        elif os.environ.get("JEV_SEED_NAMES", "0") == "1" and not use_llm_judge:
+            # Wide mode: the judge picks which names of a seed body to
+            # follow, as it already does for every chain body. Without
+            # this a seed opens the definition of every name it uses that
+            # has 1..JEV_EXPAND_MAX_DEFS definitions (Q7 2026-11-06: 91 of
+            # 119 chain verdicts were rejects, ~70 of them on that route:
+            # UA_Int16, struct, void, subscriptionId, TAILQ_*). A failed
+            # call leaves follow unset, so that seed keeps the blind route.
+            # names already read (every seed symbol) are not worth searching
+            # next: the test seed on Q7 put 0.79 on UA_MonitoredItem_sample,
+            # seed rank 28, and 0.01 on the name that led somewhere new
+            _read = {m["symbol"] for m in level if m.get("symbol")}
+            def _seed_names(n):
+                pool = [t for t in _name_pool(org_redis, n) if t not in _read]
+                if not pool:
+                    return n, {}, 0.0
+                _ex, _cut = _excerpt(n["body"], n["hit"])
+                _v, _p, _c, picks, _d = _jev_verdict_names(
+                    client, _strip_desc({"question": question,
+                                         "file": n["file"], "symbol": n["symbol"],
+                                         "description": n.get("desc") or "",
+                                         "code": _ex}),
+                    instructions, pool)
+                return n, picks, _c or 0.0
+            with ThreadPoolExecutor(max_workers=judge_workers) as ex:
+                results = list(ex.map(_seed_names,
+                                      [n for n in level if n.get("body")]))
+            for n, picks, _c in results:
+                scored += 1
+                cost += _c
+                if n.get("root_i") is not None:
+                    per_seed[n["root_i"]]["calls"] += 1
+                    per_seed[n["root_i"]]["cost"] += _c
+                if picks:
+                    n["follow"] = _picked(picks)
+                decisions.append({
+                    "kind": "start", "step": 0,
+                    "from": f"`{n['symbol']}` in {n['file']}",
+                    "scored": {k: round(float(v), 2) for k, v in sorted(
+                        picks.items(), key=lambda t: -t[1])},
+                    "chosen": list(n.get("follow") or []),
+                    "call_failed": not picks})
+                print(f"🌱 seed names `{n['symbol']}` ({n['file']}): "
+                      f"follow={n.get('follow')} —" + _fmt_picks(picks))
         # budget is per hop, so a chain can go deeper than one hop
         while level and hops < max_hops and len(added) < max_add and used < max_chars:
             # All names of this hop are known now: note them, search the
@@ -2354,11 +2445,16 @@ async def _gather_evidence(question: str, org_redis, org_redis_binary, as_of,
             # Where the kept seeds sat in the embedding ranking: tells whether
             # JEV_PREFILTER_TOP_K can be lowered without losing seeds.
             _pos = {sid: i + 1 for i, sid in enumerate(_pre_ids)}
-            _ranks = sorted(_pos[s["skill_id"]] for s in skills if s.get("skill_id") in _pos)
+            _ranked = sorted((_pos[s["skill_id"]], s) for s in skills
+                             if s.get("skill_id") in _pos)
+            _ranks = [r for r, _ in _ranked]
             if _ranks:
                 _rl = (f"kept seeds at knn ranks: median {_ranks[len(_ranks) // 2]}, "
                        f"max {_ranks[-1]} (of {len(_pre_ids)})")
                 print(f"🎯 {_rl}")
+                for r, s in _ranked:
+                    print(f"   🎯 rank {r:>3}  score {s['score']:.2f}  "
+                          f"{s['file_path']} `{s['symbol']}`")
                 info["seed_ranks"] = _ranks
         _msg = (f"Jev kept {_ji['kept']} of {_ji['scored']} skills "
                 f"(score >= {_ji['min_score']}, {_ji['above']} above the cut, "
