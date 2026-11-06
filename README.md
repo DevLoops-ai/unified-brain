@@ -2,7 +2,7 @@
 
 **Persistent memory for System One coding agents, by [DevLoops](https://devloops.ai).**
 
-On 24/10/2026 I have published as OSS a framework I call unified-brain: evidence gathering that is fast and cheap, and as accurate as a frontier coding agent. On the same nine-question, 74-point xz benchmark (`evals/questions/xz.md`) it scores 93.2 % — the same as a Claude Fable 5.1 agent, against 94.6 % for a Claude Opus 5.5 agent — at 1/8 and 1/20 of their cost (prompt caching on), 2.4–3.5× faster. It started at 86.5 % on 29/10; the four retrieval changes that closed the gap are each written up in `evals/results/`. The gathering is done by Jev, a frontier decision judge model, not by the frontier model.
+On 24/10/2026 I have published as OSS a framework I call unified-brain: evidence gathering that is fast and cheap, and as accurate as a frontier coding agent. On the same nine-question, 74-point xz benchmark (`evals/questions/xz.md`) it has two measured profiles (`env.example`): **coverage** scores 94.6 % (70 / 74) — equal to a Claude Opus 5.5 agent and above a Claude Fable 5.1 agent (69 / 74) — and **cheap** scores 92.9 % (68.75 / 74) at 1/27 of Opus's and 1/69 of Fable's cost (prompt caching on for the agents), 2.3× and 3.4× faster. It started at 86.5 % on 29/10; every retrieval change on the way is written up in `evals/results/`. The gathering is done by a decision judge model (Jev, or the open-weights pplx-decider in the cheap profile), not by the frontier model.
 
 The magic sauce is an intermediary OS (SQLITE) memory layer that facilitates retrieval, filtering and judging through a System One model, namely Jev.
 
@@ -260,27 +260,35 @@ The service also answers plain HTTP for scripts: `POST /api/retrieve`,
 
 ### What a question costs
 
-Measured with the configuration in Part 1 of `env.example`:
+Measured with the two profiles in `env.example` (the cheap one is the
+default):
 
-- open62541 (300k lines of C, sparse comments), hard tracing questions:
-  Jev $0.07–0.09 in 15s, plus the writer: $0.01 on DeepSeek V4.1
-  Flash (85–110k tokens in, 6–11k out), most of it spent thinking before
-  the first word — 60–120 s per answer in total depending on provider speed/traffic.
-- xz (heavily commented): about the same per question, but the fixed
-  scoring step costs more ($0.036 vs $0.014 for the same 400 calls) because
-  xz's bodies carry many more tokens each.
-- Vague questions ("what is this library for?") are cheaper on Jev.
+- Cheap profile (pplx-decider, knn top-20, definitions triage), xz: judge
+  $0.003–0.021 per question (35–204 judge calls), plus the writer $0.007–
+  0.028 on DeepSeek V4.1 Flash (19–107k tokens in, 3–20k out, most of it
+  thinking before the first word) — $0.01–0.05 and 40–120 s per answer,
+  the time set by the writer.
+- Coverage profile (Jev, knn top-400): judge $0.05–0.11 per xz question,
+  about 3× the cheap profile; the fixed scoring step alone is 400 calls
+  ($0.036 on xz, $0.014 on open62541 — xz's bodies carry more tokens).
+  open62541 hard tracing questions: Jev $0.07–0.09 in 15 s.
+- Vague questions ("what is this library for?") are cheaper on the judge
+  — but they get the documentation's view of the code, which can be stale
+  (xz's README still says threaded decompression is unimplemented).
 - One comparison so far, same question, same Cursor model, caches cold:
   Cursor exploring on its own used 9% of a $20 plan; with unified-brain
   2% plus $0.12 of Jev. The question set is `/evals`;
   the Cursor answers themselves are not in the repo.
 - Nine xz questions, 74 reference points, against Claude Opus 5.5 and
   Fable 5.1 agents with shell access (one run each, prompt caching on):
-  unified-brain 69 / 74 at $0.874 and 498 s (run d, 2026-11-01; the
-  first run on 2026-10-29 was 64 / 74 at $0.685); Opus 70 / 74 at $6.84
-  and 1,183 s; Fable 69 / 74 at $17.55 and 1,736 s. Grader: Fable 5.1,
-  with the keys fixed before the runs. Questions and keys in
-  `evals/questions/xz.md`, one dated file per run in `evals/results/`.
+  unified-brain coverage profile 70 / 74 (run f, 2026-11-05; the last
+  Jev run with complete footers, run d, was 69 / 74 at $0.874 and
+  498 s); cheap profile 68.75 / 74 at $0.253 and 519 s
+  (`qa-xz-2026-11-06-pplx.md`); the first run on 2026-10-29 was 64 / 74
+  at $0.685. Opus 70 / 74 at $6.84 and 1,183 s; Fable 69 / 74 at $17.55
+  and 1,736 s. Grader: Fable 5.1, with the keys fixed before the runs.
+  Questions and keys in `evals/questions/xz.md`, one dated file per run
+  in `evals/results/`.
 
 Each answer ends with a line of these numbers for your own run. Part 2 of
 `env.example` lists the constants that move them; the ones we tested are
