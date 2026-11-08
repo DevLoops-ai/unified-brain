@@ -2,7 +2,9 @@
 
 **Persistent memory for System One coding agents, by [DevLoops](https://devloops.ai).**
 
-On 24/10/2026 I have published as OSS a framework I call unified-brain: evidence gathering that is fast and cheap, and as accurate as a frontier coding agent. On the same nine-question, 74-point xz benchmark (`evals/questions/xz.md`) it has two measured profiles (`env.example`): **coverage** scores 94.6 % (70 / 74) — equal to a Claude Opus 5.5 agent and above a Claude Fable 5.1 agent (69 / 74) — and **cheap** scores 92.9 % (68.75 / 74) at 1/27 of Opus's and 1/69 of Fable's cost (prompt caching on for the agents), 2.3× and 3.4× faster. It started at 86.5 % on 29/10; every retrieval change on the way is written up in `evals/results/`. The gathering is done by a decision judge model (Jev, or the open-weights pplx-decider in the cheap profile), not by the frontier model.
+On 24/10/2026 I have published as OSS a framework I call unified-brain: evidence gathering that is fast and cheap, and as accurate as a frontier coding agent. On the same nine-question, 74-point xz benchmark (`evals/questions/xz.md`) it has two measured profiles (`env.example`): **coverage** scores 94.6 % (70 / 74) — equal to a Claude Opus 5.5 agent and above a Claude Fable 5.1 agent (69 / 74) — and **cheap** scores 92.9 % (68.75 / 74) at 1/27 of Opus's and 1/69 of Fable's cost (prompt caching on for the agents), 2.3× and 3.4× faster. It started at 86.5% on 29/10; every retrieval change on the way is written up in `evals/results/`. The evaluator is done by a decision judge model (Jev, or the open-weights pplx-decider in the cheap profile), not by the writer model that can be anything you want.
+
+The writer is a totally separate phase that works in one go.
 
 The magic sauce is an intermediary OS (SQLITE) memory layer that facilitates retrieval, filtering and judging through a System One decision model — by default pplx-decider, an open-weights 27B (Apache-2.0); Jev, a proprietary one, in the coverage profile.
 
