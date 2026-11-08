@@ -4,7 +4,7 @@
 
 On 24/10/2026 I have published as OSS a framework I call unified-brain: evidence gathering that is fast and cheap, and as accurate as a frontier coding agent. On the same nine-question, 74-point xz benchmark (`evals/questions/xz.md`) it has two measured profiles (`env.example`): **coverage** scores 94.6 % (70 / 74) — equal to a Claude Opus 5.5 agent and above a Claude Fable 5.1 agent (69 / 74) — and **cheap** scores 92.9 % (68.75 / 74) at 1/27 of Opus's and 1/69 of Fable's cost (prompt caching on for the agents), 2.3× and 3.4× faster. It started at 86.5 % on 29/10; every retrieval change on the way is written up in `evals/results/`. The gathering is done by a decision judge model (Jev, or the open-weights pplx-decider in the cheap profile), not by the frontier model.
 
-The magic sauce is an intermediary OS (SQLITE) memory layer that facilitates retrieval, filtering and judging through a System One model, namely Jev.
+The magic sauce is an intermediary OS (SQLITE) memory layer that facilitates retrieval, filtering and judging through a System One decision model — by default pplx-decider, an open-weights 27B (Apache-2.0); Jev, a proprietary one, in the coverage profile.
 
 The agent spawned from unified-brain runs through MCP on Cursor, OpenCode or Claude Code etc. allowing you to use it through your favorite harness.
 
@@ -46,7 +46,7 @@ Perhaps the most exciting development however from this proposed shift (establis
 
 - **Reduced demand for frontier-model execution.** Reserving the generative model primarily for synthesis can reduce its total inference workload, potentially lowering the serving capacity needed for a fixed volume of tasks.
 
-- **Potentially greater serving capacity.** Reducing generative investigation could allow existing infrastructure to serve more correctly answered questions per minute by freeing model execution time and KV-cache capacity. The gain depends on the serving bottleneck and the resources required by Jev, retrieval, and final synthesis.
+- **Potentially greater serving capacity.** Reducing generative investigation could allow existing infrastructure to serve more correctly answered questions per minute by freeing model execution time and KV-cache capacity. The gain depends on the serving bottleneck and the resources required by the judge, retrieval, and final synthesis.
 
 - **Potentially fewer corrective attempts.** If structured discovery improves evidence completeness and accuracy, it can reduce costly follow-up investigation and answer regeneration.
 
@@ -69,7 +69,7 @@ Functions, Types, Macros`"]:::step
     VectorDB["3. Structural Vector DB"]:::step
     Candidates["Candidate Subsets"]:::process
     Filtered["Precision Matches"]:::process
-    Dynamic["`Jev-Guided Iterative Exploration
+    Dynamic["`Judge-Guided Iterative Exploration
 Follows Symbol References and Expands Evidence`"]:::process
     Writer["`Single LLM Call
 Synthesizes the Answer from Gathered Evidence`"]:::step
@@ -77,14 +77,14 @@ Synthesizes the Answer from Gathered Evidence`"]:::step
     Code -->|Tree-sitter Parsing| Entities
     Entities -->|Embedding Pass| VectorDB
     VectorDB -->|Tier 1: Initial Retrieval| Candidates
-    Candidates -->|Tier 2: Jev Re-Scoring| Filtered
+    Candidates -->|Tier 2: Judge Re-Scoring| Filtered
     Filtered -->|Tier 3: Smart Grep Discovery| Dynamic
     Dynamic -->|Compiled Evidence| Writer
 ```
 
-I understand that Jev is proprietary and creates a dependency BUT as time passes by, I expect open-source models to narrow the gap over time, giving OS end users additional options. At the moment however, I must say, I have come to the conclusion after my limited experiments, that there is no parity.
+The judge is no longer tied to one vendor. On 2026-11-05 I wrote here that there was no parity between Jev and the open models I had tried; a day later pplx-decider (Perplexity's 27B decision model, Apache-2.0 licence with gated weights, $0.02 / M on OpenRouter) is the default judge. It is still a hosted model: the weights need an authorised token and Perplexity's own serving code, so running the judge on your own machine is not yet an option with either model. Measured on the same nine xz questions: Jev 70 / 74 at about 9 cents of judge cost per question ($0.49 for the nine); pplx-decider 68.75 / 74 at about 1 cent per question ($0.09 for the nine) with the cheap settings (`evals/results/qa-xz-2026-11-06-pplx.md`). With Jev's own settings pplx-decider scored 66.5 (`qa-xz-2026-11-05-b-pplx.md`), and another open 27B, Cloudflare Clef, scored lower at six times Jev's cost — so this is one model that works, not open models in general. Jev stays the coverage profile: 1.25 points ahead, for three times the judge cost.
 
-Right now, I believe we should ride this wave of innovation in order to deliver new capabilities to end users at a price the frontier agents do not reach today.
+With the fixed 400-call scoring step gone (35–204 judge calls per question now), a judge running on the user's own machine is the next thing to try.
 
 ## How it works
 
@@ -95,19 +95,20 @@ db inside the repository in question (`<repo>/.unified-brain.db`). On top of tha
 answers two questions, as of any commit:
 
 - **Ask** — "why does X do Y?", answered from the bodies that were live at the
-  commits you pick, found by embeddings → Jev (a small judge model that scores
-  and follows names through the code) → one write by the LLM of your choice.
+  commits you pick, found by embeddings → a decision judge (pplx-decider or
+  Jev: a small model that scores bodies and follows names through the code)
+  → one write by the LLM of your choice.
 - **Timeline / reports** — pick a range of commits and have every changed symbol
   judged: does the change do what the commit message says, or is there a defect
   or a malicious intent behind it? Each verdict comes with the evidence the
-  judge was shown (diffs, same-commit changes, callers, the chains Jev followed).
+  judge was shown (diffs, same-commit changes, callers, the chains it followed).
 
 No LLM is used during ingestion. One embedding pass runs at the end.
 
 ## Requirements
 
 - Python 3.11 or newer (SQLite comes with it; nothing else to install or run)
-- API keys: [OpenRouter](https://openrouter.ai) (Jev), one embedding provider —
+- API keys: [OpenRouter](https://openrouter.ai) (the judge), one embedding provider —
   [Voyage AI](https://www.voyageai.com) or [DeepInfra](https://deepinfra.com)
   (Qwen3-Embedding-8B, cheaper) — and one writer provider ([Fireworks](https://fireworks.ai)
   for DeepSeek, or Anthropic).
@@ -137,7 +138,7 @@ DB_PATH=/Users/you/code/xz/.unified-brain.db
 # writer: llmbase = DeepSeek V4.1 Flash on Fireworks, or anthropic
 LLM_PROVIDER=llmbase
 LLM_API_KEY=...
-# Jev, through OpenRouter
+# the judge (pplx-decider by default; typesafe/jev-1.13 for coverage), through OpenRouter
 OPENROUTER_API_KEY=...
 # code embeddings: qwen (the evals), or voyage (then set VOYAGE_API_KEY instead)
 CODE_EMBED_PASS2=qwen
@@ -228,7 +229,7 @@ python codebase_qa_service.py
 
 Open http://127.0.0.1:8000 to ask questions and http://127.0.0.1:8000/timeline
 for the commit timeline and reports. The server listens on localhost only.
-Each answer ends with a line of numbers: time per phase, Jev cost, writer speed.
+Each answer ends with a line of numbers: time per phase, judge cost (the footer still labels it "Jev"), writer speed.
 Ctrl+C stops it.
 
 To switch repositories, stop the service, change `DB_PATH`, start it again.
@@ -252,7 +253,7 @@ Cursor — `.cursor/mcp.json` in the project you are working on (Cursor settings
 ```
 
 Claude Code — the same object in `.mcp.json`. The tool takes 20–60 seconds
-(Jev is reading); ask the agent to use unified-brain for the question.
+(the judge is reading); ask the agent to use unified-brain for the question.
 
 The service also answers plain HTTP for scripts: `POST /api/retrieve`,
 `GET /api/grep`, `/api/symbol/{name}`, `/api/body`, `/api/history`,
