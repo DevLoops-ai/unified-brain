@@ -699,6 +699,10 @@ def _sse_event(payload: dict) -> str:
 
 JEV_URL = "https://openrouter.ai/api/alpha/decisions"
 JEV_MODEL = os.environ.get("JEV_MODEL", "typesafe/jev-1.13")   # or cloudflare/clef-flash
+# Optional second judge for the two places where few calls decide a lot:
+# the seed scoring and the hit triage. Empty = same model as JEV_MODEL.
+JEV_SELECT_MODEL = os.environ.get("JEV_SELECT_MODEL") or JEV_MODEL
+JEV_TRIAGE_MODEL = os.environ.get("JEV_TRIAGE_MODEL") or JEV_MODEL
 
 def _jev_rows_as_of(org_redis, rows: list, to_rank: int) -> list:
     """rows = [(skill_id, current record)]. Keeps the skills that existed at
@@ -795,7 +799,7 @@ def _jev_select(question: str, org_redis,
 
     def _score(c: dict) -> None:
         payload = {
-            "model": JEV_MODEL,
+            "model": JEV_SELECT_MODEL,
             "state": _strip_desc({
                 "file": c["p"][0], "symbol": c["p"][1],
                 "description": c["sk"].get("description_of_skill", ""),
@@ -1303,7 +1307,7 @@ def _jev_triage_hits(client, state: dict, hits: list[dict], around: int = 3):
                              "on which platforms or with which options something "
                              "happens."),
         }
-    payload = {"model": JEV_MODEL,
+    payload = {"model": JEV_TRIAGE_MODEL,
                "state": {**state, "places": "\n\n".join(shown)},
                "questions": questions}
     last_err = None
@@ -1335,6 +1339,14 @@ def _jev_triage_hits(client, state: dict, hits: list[dict], around: int = 3):
     return {}, 0.0
 
 
+_DERIVED_INSTRUCTIONS = (
+    "Is this `code` a derived copy of text that exists elsewhere in the "
+    "repository in its original form — a translation or localisation "
+    "catalog, a mirrored or generated file — AND the `question` is not "
+    "about that copy itself (its translations, how it is generated, what "
+    "differs in it)? Answer no when the `question` asks about such copies.")
+
+
 def _jev_verdict_names(client, state: dict, instructions: str,
                        names: list[str]):
     """One Jev call, two kinds of questions on the same body: the
@@ -1346,16 +1358,8 @@ def _jev_verdict_names(client, state: dict, instructions: str,
     # Asked apart from the verdict, so the wording does not colour it
     # (run c put this in the verdict instruction; license-check.sh went
     # from accepted to rejected, Q4 2026-11-01).
-    questions["derived"] = {
-        "type": "noul",
-        "instructions": ("Is this `code` a derived copy of text that exists "
-                         "elsewhere in the repository in its original form — "
-                         "a translation or localisation catalog, a mirrored "
-                         "or generated file — AND the `question` is not about "
-                         "that copy itself (its translations, how it is "
-                         "generated, what differs in it)? Answer no when the "
-                         "`question` asks about such copies."),
-    }
+    questions["derived"] = {"type": "noul",
+                            "instructions": _DERIVED_INSTRUCTIONS}
     as_choice = _names_as_choice() and bool(names)
     if as_choice:
         # One question: which name from `code` should be searched next?
@@ -1418,6 +1422,95 @@ def _jev_verdict_names(client, state: dict, instructions: str,
         return None, {}, 0.0, {}
     print(f"⚠️  Jev chain call gave up after 4 tries: candidate dropped ({_scrub(str(last_err))})")
     return None, {}, 0.0, {}
+
+
+def _jev_verdict_names_batch(client, shared: dict, items: list[dict],
+                             instructions: str):
+    """JEV_BATCH_SIBLINGS=1: one Jev call for the siblings of one parent.
+    The part of the state they share (question, chain, the ancestors'
+    code) is sent once; each candidate's own fields go under
+    `candidates`; the same questions _jev_verdict_names asks are asked
+    once per candidate. `items`: [{key, state, names}]. Returns
+    ({key: (verdict, probabilities, picks, derived)}, cost). A key that
+    is missing from the result had no usable answer: the caller asks for
+    that candidate alone, as before."""
+    state = dict(shared)
+    state["candidates"] = {it["key"]: it["state"] for it in items}
+    questions: dict = {}
+    for it in items:
+        k, names = it["key"], it["names"]
+        where = f"candidate `{k}` in `candidates`"
+        own = f"For {where} only — its own `code`, `file`, `symbol` and `reached_because` — "
+        questions[f"v_{k}"] = {
+            "type": "choice",
+            "instructions": own + instructions,
+            "criteria": _JEV_VERDICTS}
+        questions[f"derived_{k}"] = {
+            "type": "noul",
+            "instructions": own + _DERIVED_INSTRUCTIONS}
+        if _names_as_choice() and names:
+            questions[f"names_{k}"] = {
+                "type": "choice",
+                "instructions": (f"Which name from the `code` of {where} should "
+                                 "be searched next to get closer to answering "
+                                 "the `question`? Pick \"(none of these)\" if "
+                                 "no name is worth following."),
+                "criteria": {**{name: f'search "{name}" next' for name in names},
+                             _NONE_NAME: "no name here is worth searching"},
+            }
+        else:
+            for i, name in enumerate(names):
+                questions[f"n_{k}_{i}"] = {
+                    "type": "noul",
+                    "instructions": (f'Should the name "{name}" from the `code` '
+                                     f"of {where} be searched next to get closer "
+                                     "to answering the `question`?"),
+                }
+    payload = {"model": JEV_MODEL, "state": state, "questions": questions}
+    last_err = None
+    for attempt in range(4):
+        try:
+            res = client.post(JEV_URL, json=payload)
+        except httpx.HTTPError as e:
+            last_err = e
+            time.sleep(2 ** attempt)
+            continue
+        if res.status_code == 429 or res.status_code >= 500:
+            if attempt == 0:
+                print(f"⏳ Jev batch call got HTTP {res.status_code}, retrying")
+            time.sleep(2 ** attempt)
+            continue
+        try:
+            data = res.json()
+        except ValueError:
+            return {}, 0.0
+        if res.status_code != 200:
+            print(f"⚠️  Jev batch call failed: HTTP {res.status_code} "
+                  f"{_scrub(res.text[:200])}")
+            return {}, 0.0
+        answers = data.get("answers") or {}
+        out = {}
+        for it in items:
+            k, names = it["key"], it["names"]
+            ans = answers.get(f"v_{k}") or {}
+            if ans.get("choice") not in _JEV_VERDICTS:
+                continue                     # no usable answer: asked alone by the caller
+            picks = {}
+            if _names_as_choice() and names:
+                probs = (answers.get(f"names_{k}") or {}).get("probabilities") or {}
+                picks = {n: float(p) for n, p in probs.items()
+                         if n in names or n == _NONE_NAME}
+            else:
+                for i, name in enumerate(names):
+                    a = answers.get(f"n_{k}_{i}") or {}
+                    if a.get("noul") is not None:
+                        picks[name] = float(a["noul"])
+            d = (answers.get(f"derived_{k}") or {}).get("noul")
+            out[k] = (ans["choice"], ans.get("probabilities") or {}, picks,
+                      float(d) if d is not None else 0.0)
+        return out, float((data.get("usage") or {}).get("cost") or 0)
+    print(f"⚠️  Jev batch call gave up after 4 tries ({_scrub(str(last_err))})")
+    return {}, 0.0
 
 
 
@@ -2010,6 +2103,28 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                 break
             hops += 1
             _fill_descriptions(org_redis, cands)
+            def _prep(c: dict):
+                """The Jev state of one candidate and the names it offers."""
+                lk = _link(c)
+                state = _strip_desc({
+                    "question": question,
+                    "already_established": c["chain"],
+                    "previous_steps": _prev_steps(c, body_cap),
+                    "reached_because": c["why"] + (f"; line: `{lk}`" if lk else ""),
+                    "file": c["file"], "symbol": c["symbol"],
+                    "description": c.get("desc") or "",
+                    "code": c["excerpt"],
+                })
+                pool = _name_pool(org_redis, c)
+                if not chains:
+                    # wide mode: every place of the name this body was
+                    # reached by is already in `seen`; offering it again
+                    # only takes share from the other names
+                    via = re.search(r"it (?:mentions|defines) `([^`]+)`",
+                                    c.get("why") or "")
+                    if via:
+                        pool = [t for t in pool if t != via.group(1)]
+                return state, pool
 
             def _judge(c: dict) -> None:
                 c["excerpt"], c["cut"] = _excerpt(c["body"], c["hit"])
@@ -2019,66 +2134,116 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                         judge_target, question, c["chain"], c["why"],
                         c["file"], c["symbol"], c["excerpt"])
                 else:
-                    lk = _link(c)
-                    state = _strip_desc({
-                        "question": question,
-                        "already_established": c["chain"],
-                        "previous_steps": _prev_steps(c, body_cap),
-                        "reached_because": c["why"] + (f"; line: `{lk}`" if lk else ""),
-                        "file": c["file"], "symbol": c["symbol"],
-                        "description": c.get("desc") or "",
-                        "code": c["excerpt"],
-                    })
-                    pool = _name_pool(org_redis, c)
-                    if not chains:
-                        # wide mode: every place of the name this body was
-                        # reached by is already in `seen`; offering it again
-                        # only takes share from the other names
-                        via = re.search(r"it (?:mentions|defines) `([^`]+)`",
-                                        c.get("why") or "")
-                        if via:
-                            pool = [t for t in pool if t != via.group(1)]
+                    state, pool = _prep(c)
                     raw_v, _p, c["cost"], picks, derived = _jev_verdict_names(
                         client, state, instructions, pool)
-                    sure = float(os.environ.get("JEV_SURE_REJECT", "0.75"))
-                    dmin = float(os.environ.get("JEV_DERIVED_MIN", "0.65"))
-                    retry = ""
-                    if ((raw_v == "reject" and _just_over(_p.get("reject"), sure))
-                            or _just_over(derived, dmin)):
-                        # a sure reject or a derived-copy call by a hair:
-                        # ask once more, keep the more permissive answer
-                        # (lower reject, lower derived); the names stay
-                        # from the first call
-                        raw2, p2, cost2, _picks2, derived2 = _jev_verdict_names(
-                            client, state, instructions, pool)
-                        c["cost"] += cost2
-                        if raw2 is not None:
-                            retry = (f" retry: reject {float(_p.get('reject', 0)):.2f}"
-                                     f"→{float(p2.get('reject', 0)):.2f}"
-                                     f" derived {derived:.2f}→{derived2:.2f}")
-                            if float(p2.get("reject", 0)) < float(_p.get("reject", 0)):
-                                raw_v, _p = raw2, p2
-                            derived = min(derived, derived2)
-                    c["retry"] = retry.strip()
-                    c["verdict"] = _settle(raw_v, _p)
-                    c["verdict_raw"] = raw_v    # before _settle: a real continue vs an unsure reject
-                    c["derived"] = derived
-                    if derived > dmin:
-                        # Jev says this body is a copy of text that exists
-                        # elsewhere: a dead end, whatever the verdict said
-                        c["verdict"] = c["verdict_raw"] = "reject"
-                    c["probs"], c["picks"] = _p, picks
-                    # the names Jev said yes to are searched in the next hop
-                    c["follow"], c["toks"] = _picked(picks), (0, 0)
-                    c["reason"] = (_fmt_probs(_p)
-                                   + (" (not sure: continue)"
-                                      if raw_v != c["verdict"] else "")
-                                   + f" derived={derived:.2f}"
-                                   + retry
-                                   + _fmt_picks(picks))
+                    _apply(c, raw_v, _p, picks, derived, state, pool)
+
+            def _judge_batch(group: list[dict]) -> None:
+                """JEV_BATCH_SIBLINGS=1: the candidates under one parent in
+                one call. They share the question, the chain and the
+                ancestors' code, so those go once. Packed by the API's
+                limit of 128 questions and JEV_BATCH_MAX_CHARS of state per
+                call; a full call is followed by another, nothing is left
+                out. A candidate the batch gave no answer for is asked
+                alone, exactly as without batching."""
+                n = group[0]["parent"]
+                per_cand = 3 if _names_as_choice() else None
+                max_chars = int(os.environ.get("JEV_BATCH_MAX_CHARS", "600000"))
+                items: list[dict] = []
+                for i, c in enumerate(group):
+                    c["excerpt"], c["cut"] = _excerpt(c["body"], c["hit"])
+                    state, pool = _prep(c)
+                    c["_bk"], c["_bstate"], c["_bpool"] = f"c{i}", state, pool
+                    items.append({"key": c["_bk"], "names": pool, "cand": c,
+                                  "state": {k: state[k] for k in
+                                            ("reached_because", "file", "symbol",
+                                             "description", "code") if k in state}})
+                # the ancestors once, with the whole room: no candidate's
+                # own size takes from it here
+                shared = {
+                    "question": question,
+                    "already_established": group[0]["chain"],
+                    "previous_steps": _prev_steps({**group[0], "excerpt": ""}, body_cap),
+                    "reached_from": f"`{n['symbol']}` in {n['file']}",
+                }
+                base = len(json.dumps(shared))
+                chunks: list[list[dict]] = [[]]
+                q_n, chars = 0, base
+                for it in items:
+                    q = per_cand if per_cand else 2 + len(it["names"])
+                    size = len(it["state"].get("code") or "")
+                    if chunks[-1] and (q_n + q > 128 or chars + size > max_chars):
+                        chunks.append([])
+                        q_n, chars = 0, base
+                    chunks[-1].append(it)
+                    q_n += q
+                    chars += size
+                for chunk in chunks:
+                    got, cost_ = _jev_verdict_names_batch(client, shared, chunk, instructions)
+                    share = cost_ / len(chunk) if chunk else 0.0
+                    for it in chunk:
+                        c = it["cand"]
+                        r = got.get(it["key"])
+                        if r is None:
+                            raw_v, _p, c["cost"], picks, derived = _jev_verdict_names(
+                                client, c["_bstate"], instructions, c["_bpool"])
+                            tag = " batch=alone"
+                        else:
+                            raw_v, _p, picks, derived = r
+                            c["cost"] = share
+                            tag = f" batch={len(chunk)}"
+                        _apply(c, raw_v, _p, picks, derived, c["_bstate"], c["_bpool"])
+                        c["reason"] += tag
+
+            def _apply(c: dict, raw_v, _p, picks, derived, state, pool) -> None:
+                """Settle one candidate from Jev's answers: the retry by a
+                hair, the derived-copy override, the names to follow."""
+                sure = float(os.environ.get("JEV_SURE_REJECT", "0.75"))
+                dmin = float(os.environ.get("JEV_DERIVED_MIN", "0.65"))
+                retry = ""
+                if ((raw_v == "reject" and _just_over(_p.get("reject"), sure))
+                        or _just_over(derived, dmin)):
+                    # a sure reject or a derived-copy call by a hair:
+                    # ask once more, keep the more permissive answer
+                    # (lower reject, lower derived); the names stay
+                    # from the first call
+                    raw2, p2, cost2, _picks2, derived2 = _jev_verdict_names(
+                        client, state, instructions, pool)
+                    c["cost"] += cost2
+                    if raw2 is not None:
+                        retry = (f" retry: reject {float(_p.get('reject', 0)):.2f}"
+                                 f"→{float(p2.get('reject', 0)):.2f}"
+                                 f" derived {derived:.2f}→{derived2:.2f}")
+                        if float(p2.get("reject", 0)) < float(_p.get("reject", 0)):
+                            raw_v, _p = raw2, p2
+                        derived = min(derived, derived2)
+                c["retry"] = retry.strip()
+                c["verdict"] = _settle(raw_v, _p)
+                c["verdict_raw"] = raw_v    # before _settle: a real continue vs an unsure reject
+                c["derived"] = derived
+                if derived > dmin:
+                    # Jev says this body is a copy of text that exists
+                    # elsewhere: a dead end, whatever the verdict said
+                    c["verdict"] = c["verdict_raw"] = "reject"
+                c["probs"], c["picks"] = _p, picks
+                # the names Jev said yes to are searched in the next hop
+                c["follow"], c["toks"] = _picked(picks), (0, 0)
+                c["reason"] = (_fmt_probs(_p)
+                               + (" (not sure: continue)"
+                                  if raw_v != c["verdict"] else "")
+                               + f" derived={derived:.2f}"
+                               + retry
+                               + _fmt_picks(picks))
 
             with ThreadPoolExecutor(max_workers=judge_workers) as ex:
-                list(ex.map(_judge, cands))
+                if os.environ.get("JEV_BATCH_SIBLINGS", "0") == "1" and not use_llm_judge:
+                    groups: dict = {}
+                    for c in cands:
+                        groups.setdefault(id(c["parent"]), []).append(c)
+                    list(ex.map(_judge_batch, groups.values()))
+                else:
+                    list(ex.map(_judge, cands))
             scored += len(cands)
             for c in cands:
                 if c.get("root_i") is not None:
@@ -2697,6 +2862,15 @@ async def _ask_internal_stream(req: AskRequest, max_tokens: int = 27000):
             "jev_cost": round((_sel.get("cost") or 0) + (_exp.get("cost") or 0), 4),
             "total_secs": round(time.time() - start_time, 1),
         }
+        # Writer cost at list price, from WRITER_PRICE_IN / WRITER_PRICE_OUT
+        # ($ per million tokens, in .env). The judge's cost above is the
+        # provider's own figure; this one is tokens x the price you entered.
+        _p_in, _p_out = os.environ.get("WRITER_PRICE_IN"), os.environ.get("WRITER_PRICE_OUT")
+        if _p_in and _p_out:
+            metrics["writer_cost_list"] = round(
+                metrics["writer_in_tokens"] * float(_p_in) / 1e6
+                + _out_tok * float(_p_out) / 1e6, 4)
+            metrics["total_cost"] = round(metrics["jev_cost"] + metrics["writer_cost_list"], 4)
         print(f"📊 {json.dumps(metrics)}")
         yield _sse_event({"type": "metrics", "metrics": metrics})
 
@@ -2747,6 +2921,14 @@ PROVIDER_DEFAULTS = {
         "api_base":     "https://api.fireworks.ai/inference/v1",
         # reasoning_effort is added per call where the writer/judge needs it.
         "extra_params": {},
+    },
+    "isoquant": {
+        # DeepSeek V4.1 Flash (1017 build) on Isoquant, OpenAI-compatible.
+        # Isoquant-ZDR: required = zero data retention, refused if the
+        # endpoint cannot honour it.
+        "model":        "openai/deepseek-v4.1-flash-1017-fast",
+        "api_base":     "https://api.isoquant.ai/v1",
+        "extra_params": {"extra_headers": {"Isoquant-ZDR": "required"}},
     },
 }
 

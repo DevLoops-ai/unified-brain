@@ -137,8 +137,11 @@ lines — python-dotenv reads `KEY=value  # text` as the value `# text`):
 ```
 # the database the service answers about (written by step 2)
 DB_PATH=/Users/you/code/xz/.unified-brain.db
-# writer: llmbase = DeepSeek V4.1 Flash on Fireworks, or anthropic
-LLM_PROVIDER=llmbase
+# writer: llmbase = DeepSeek V4.1 Flash on Fireworks (the evals' writer),
+#         isoquant = the same model's 1017 build on Isoquant with zero data
+#         retention (Isoquant-ZDR: required; unmeasured on the evals until
+#         a results file says otherwise), or anthropic
+LLM_PROVIDER=isoquant
 LLM_API_KEY=...
 # the judge (pplx-decider by default; typesafe/jev-1.13 for coverage), through OpenRouter
 OPENROUTER_API_KEY=...
