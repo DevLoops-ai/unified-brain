@@ -703,6 +703,10 @@ JEV_MODEL = os.environ.get("JEV_MODEL", "typesafe/jev-1.13")   # or cloudflare/c
 # the seed scoring and the hit triage. Empty = same model as JEV_MODEL.
 JEV_SELECT_MODEL = os.environ.get("JEV_SELECT_MODEL") or JEV_MODEL
 JEV_TRIAGE_MODEL = os.environ.get("JEV_TRIAGE_MODEL") or JEV_MODEL
+# Optional judge for the second opinion on a chain verdict that fell just
+# over the reject cut. A small model repeats its own number, so asking it
+# twice tells nothing (Q4 2026-11-10: seven retries, seven identical).
+JEV_RETRY_MODEL = os.environ.get("JEV_RETRY_MODEL") or JEV_MODEL
 
 def _jev_rows_as_of(org_redis, rows: list, to_rank: int) -> list:
     """rows = [(skill_id, current record)]. Keeps the skills that existed at
@@ -1348,7 +1352,8 @@ _DERIVED_INSTRUCTIONS = (
 
 
 def _jev_verdict_names(client, state: dict, instructions: str,
-                       names: list[str]):
+                       names: list[str], extra: dict | None = None,
+                       model: str | None = None):
     """One Jev call, two kinds of questions on the same body: the
     accept/continue/reject verdict, and one yes/no per name (should this
     name be searched next?). Returns (verdict or None, verdict
@@ -1360,6 +1365,20 @@ def _jev_verdict_names(client, state: dict, instructions: str,
     # from accepted to rejected, Q4 2026-11-01).
     questions["derived"] = {"type": "noul",
                             "instructions": _DERIVED_INSTRUCTIONS}
+    # JEV_SIGNPOST=1: a second question apart from the verdict, like
+    # `derived` above. A body that is no evidence can still name the place
+    # that is (.gitignore lists create_compress_files, Q4 2026-11-10). Asked
+    # only when the body has names to offer and the caller wants the answer.
+    ask_sign = (extra is not None and bool(names)
+                and os.environ.get("JEV_SIGNPOST", "0") == "1")
+    if ask_sign:
+        questions["signpost"] = {
+            "type": "noul",
+            "instructions": ("Suppose this `code` is not itself evidence for "
+                             "the `question`. Does it name another place — a "
+                             "file, a script or a function — that should be "
+                             "read to answer the `question`?"),
+        }
     as_choice = _names_as_choice() and bool(names)
     if as_choice:
         # One question: which name from `code` should be searched next?
@@ -1382,7 +1401,8 @@ def _jev_verdict_names(client, state: dict, instructions: str,
                                  "searched next to get closer to answering the "
                                  "`question`?"),
             }
-    payload = {"model": JEV_MODEL, "state": state, "questions": questions}
+    payload = {"model": model or JEV_MODEL, "state": state,
+               "questions": questions}
     last_err = None
     for attempt in range(4):
         try:
@@ -1413,6 +1433,9 @@ def _jev_verdict_names(client, state: dict, instructions: str,
                     a = answers.get(f"n{i}") or {}
                     if a.get("noul") is not None:
                         picks[name] = float(a["noul"])
+            if ask_sign:
+                sg = (answers.get("signpost") or {}).get("noul")
+                extra["signpost"] = float(sg) if sg is not None else 0.0
             d = (answers.get("derived") or {}).get("noul")
             return (ans["choice"], ans.get("probabilities") or {},
                     float((data.get("usage") or {}).get("cost") or 0), picks,
@@ -2135,8 +2158,10 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                         c["file"], c["symbol"], c["excerpt"])
                 else:
                     state, pool = _prep(c)
+                    more: dict = {}
                     raw_v, _p, c["cost"], picks, derived = _jev_verdict_names(
-                        client, state, instructions, pool)
+                        client, state, instructions, pool, more)
+                    c["sign"] = more.get("signpost")
                     _apply(c, raw_v, _p, picks, derived, state, pool)
 
             def _judge_batch(group: list[dict]) -> None:
@@ -2209,7 +2234,8 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                     # (lower reject, lower derived); the names stay
                     # from the first call
                     raw2, p2, cost2, _picks2, derived2 = _jev_verdict_names(
-                        client, state, instructions, pool)
+                        client, state, instructions, pool, {},
+                        JEV_RETRY_MODEL)
                     c["cost"] += cost2
                     if raw2 is not None:
                         retry = (f" retry: reject {float(_p.get('reject', 0)):.2f}"
@@ -2229,10 +2255,21 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                 c["probs"], c["picks"] = _p, picks
                 # the names Jev said yes to are searched in the next hop
                 c["follow"], c["toks"] = _picked(picks), (0, 0)
+                # not evidence, but it points somewhere: the judge said
+                # so itself, and it picked a name over "none of these".
+                # A derived copy stays a dead end.
+                sign = c.get("sign")
+                c["signpost"] = (
+                    sign is not None
+                    and c["verdict"] == "reject" and derived <= dmin
+                    and bool(c["follow"])
+                    and sign >= float(os.environ.get("JEV_SIGNPOST_MIN", "0.4")))
                 c["reason"] = (_fmt_probs(_p)
                                + (" (not sure: continue)"
                                   if raw_v != c["verdict"] else "")
                                + f" derived={derived:.2f}"
+                               + (f" signpost={sign:.2f}"
+                                  if sign is not None else "")
                                + retry
                                + _fmt_picks(picks))
 
@@ -2274,18 +2311,26 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                     "chars": len(c.get("excerpt") or ""),
                     "excerpt": bool(c.get("cut"))})
 
-            # accept and continue are both followed; only reject ends a chain
+            # accept and continue are both followed. A reject ends a chain,
+            # unless the judge called the body a signpost (JEV_SIGNPOST=1):
+            # then its names are followed, and the body itself goes neither
+            # to the writer nor to the leads.
             nxt: list[dict] = []
             rank = {"accept": 0, "continue": 1}
-            follow = sorted((c for c in cands if c.get("verdict") in rank),
-                            key=lambda c: rank[c["verdict"]])
+            follow = sorted((c for c in cands
+                             if c.get("verdict") in rank or c.get("signpost")),
+                            key=lambda c: rank.get(c["verdict"], 2))
             for c in follow:
                 lk = _link(c)
                 step = (f"`{c['symbol']}` in {c['file']} ({c['why']}"
-                        + (f"; line: `{lk}`" if lk else "") + ")")
+                        + (f"; line: `{lk}`" if lk else "") + ")"
+                        + (" [not evidence: it only points to the next step]"
+                           if c.get("signpost") else ""))
                 c["chain"] = f"{c['chain']}; then {step}"
                 c["trail"] = c["trail"] + [step]
-                if (c["verdict"] == "accept" and len(added) < max_add
+                if c.get("signpost"):
+                    pass
+                elif (c["verdict"] == "accept" and len(added) < max_add
                         and used <= max_chars):
                     used += len(c["excerpt"])
                     added.append(c)
