@@ -1627,6 +1627,7 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
 
     want: Optional[set] = None      # a set = only note the names, search nothing
     _glock = threading.Lock()
+    _grep_secs: dict = {}      # timing only: name -> (seconds, bodies read, kept)
 
     def _grep(name: str):
         nonlocal greps
@@ -1636,17 +1637,22 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
         if name not in grep_cache:
             with _glock:
                 greps += 1
+            _t_n = time.time()
             try:
                 grep_cache[name] = skills_lib.grep_code_ft(
                     org_redis, pattern=name, is_regex=False, file=None,
                     struct_types=None,
-                    max_results=(10 ** 6 if triage_on else max_hits + 1),
-                    exact_total=triage_on,
+                    max_results=max_hits + 1,
+                    exact_total=False,
                     include_hist=as_of is not None, as_of=as_of,
                     rank_cache=_ranks)
             except Exception as e:
                 print(f"⚠️  expand grep `{name}` failed: {_scrub(str(e))}")
                 grep_cache[name] = None
+            _r = grep_cache[name] or {}
+            _grep_secs[name] = (time.time() - _t_n,
+                                _r.get("candidates_scanned", 0),
+                                _r.get("total_matched", 0))
             if memory is not None:
                 memory.note_word(name, "system",
                                  (grep_cache[name] or {}).get("total_matched", 0))
@@ -2063,6 +2069,15 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                   f"index {_gt['index']:.2f}s · load {_gt['load']:.2f}s "
                   f"({_gt['bodies']} bodies) · check {_gt['check']:.2f}s "
                   f"({_gt['kept']} kept), summed over parallel searches")
+            print(f"⏱  waiting for a database connection: "
+                  f"{store.WAIT['secs']:.2f}s over {store.WAIT['calls']} calls")
+            store.WAIT["secs"], store.WAIT["calls"] = 0.0, 0
+            if _grep_secs:
+                _slow = sorted(_grep_secs.items(), key=lambda kv: -kv[1][0])[:5]
+                print("⏱  slowest names: " + " · ".join(
+                    f"`{n}` {v[0]:.2f}s ({v[1]} read, {v[2]} kept)"
+                    for n, v in _slow))
+                _grep_secs.clear()
             cands: list[dict] = []
             # one candidate per node in turn, so every node gets a share of the budget
             for i in range(max((len(l) for l in per), default=0) if triage_on else per_node):

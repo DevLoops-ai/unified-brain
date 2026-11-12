@@ -1132,7 +1132,12 @@ def _build_prefilter_query(pattern: str, is_regex: bool,
     alphanumeric run (nothing to filter on).
     """
     if not is_regex:
-        tokens = _TOKEN_RE.findall(pattern)
+        # A literal of 3+ characters goes to the trigram index whole
+        # (`server.h`, not `server` + `h`): the index then returns only the
+        # bodies that contain it. Split into runs, a short run such as `h`
+        # cannot use the index, so every body with `server` was opened and
+        # searched for the letter (open62541 Q8: 6,880 bodies, 9.8 s).
+        tokens = [pattern] if len(pattern) >= 3 else _TOKEN_RE.findall(pattern)
     else:
         cleaned = re.sub(r"\\[dDwWsSbBAZ]|\\.|\[[^\]]*\]|\{[^}]*\}", " ", pattern)
         cleaned = re.sub(r"[|^$.*+?()]", " ", cleaned)

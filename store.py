@@ -42,6 +42,9 @@ DB_FILE_NAME = ".unified-brain.db"
 # macOS's default limit of 256 open files.
 POOL_SIZE = 8
 
+# Timing only: how long threads waited for a free connection.
+WAIT = {"secs": 0.0, "calls": 0}
+
 # Keys whose `body` field is indexed for grep.
 _BODY_PREFIXES = ("code:", "code_hist:", "code_at:")
 # Chunk-vector rows: <prefix>:<skill_id>:<version>:<chunk>. Mean rows
@@ -66,6 +69,11 @@ CREATE TABLE IF NOT EXISTS expires (key TEXT PRIMARY KEY, at REAL NOT NULL);
 CREATE TABLE IF NOT EXISTS bodies (id INTEGER PRIMARY KEY, sha TEXT UNIQUE NOT NULL, body TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS body_keys (key TEXT PRIMARY KEY, body_id INTEGER NOT NULL);
 CREATE INDEX IF NOT EXISTS body_keys_body ON body_keys (body_id);
+-- The key next to the body id: the grep reads every key of each matching
+-- body (most are code_at: history copies) and keeps only code: ones. With
+-- the key in the index, it no longer opens the table row for each of them
+-- (open62541 `message`: 1.85 s -> 0.19 s).
+CREATE INDEX IF NOT EXISTS body_keys_body_key ON body_keys (body_id, key);
 CREATE VIRTUAL TABLE IF NOT EXISTS bodies_fts USING fts5(
     body, content='bodies', content_rowid='id', tokenize='trigram');
 CREATE TRIGGER IF NOT EXISTS bodies_ai AFTER INSERT ON bodies BEGIN
@@ -109,7 +117,10 @@ def _borrowed(fn):
     def wrapper(self, *a, **kw):
         if getattr(self._local, "conn", None) is not None:
             return fn(self, *a, **kw)
+        _t0 = time.time()
         c = self._take()
+        WAIT["secs"] += time.time() - _t0      # timing only
+        WAIT["calls"] += 1
         self._local.conn = c
         try:
             return fn(self, *a, **kw)
@@ -570,8 +581,8 @@ class Store:
         if fts:
             match = " AND ".join('"' + t.replace('"', '""') + '"' for t in fts)
             sql = ("SELECT k.key FROM bodies_fts f JOIN body_keys k ON k.body_id = f.rowid "
-                   "JOIN bodies b ON b.id = f.rowid "
-                   "WHERE bodies_fts MATCH ? AND k.key LIKE ? ESCAPE '\\'")
+                   + ("JOIN bodies b ON b.id = f.rowid " if short else "")
+                   + "WHERE bodies_fts MATCH ? AND k.key LIKE ? ESCAPE '\\'")
             params += [match, prefix.replace("_", "\\_") + "%"]
         else:
             sql = ("SELECT k.key FROM body_keys k JOIN bodies b ON b.id = k.body_id "
