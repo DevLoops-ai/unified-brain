@@ -762,7 +762,8 @@ def _jev_rows_as_of(org_redis, rows: list, to_rank: int) -> list:
 
 def _jev_select(question: str, org_redis,
                 only_ids: Optional[list[str]] = None,
-                as_of: Optional[dict] = None) -> tuple[list[dict], dict]:
+                as_of: Optional[dict] = None,
+                on_cands=None) -> tuple[list[dict], dict]:
     """TEST ARM (vector_store="jev"): score EVERY active atomic skill against
     the question with Jev (description + code) and keep the ones at or above
     JEV_MIN_SCORE, best first. No fixed top-K: the set is as large as the
@@ -817,6 +818,9 @@ def _jev_select(question: str, org_redis,
                 # No per-commit copy stored: same fallback as get_code_as_of.
                 body = skills_lib.get_code(org_redis, dk)
             cands.append({"sid": sid, "sk": sk, "dk": dk, "p": p, "body": body})
+
+    if on_cands is not None:
+        on_cands(cands)        # the bodies are known: the caller may search ahead
 
     client = httpx.Client(
         timeout=60,
@@ -1585,7 +1589,9 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                 memory=None,
                 as_of: Optional[dict] = None,
                 spread: bool = False,
-                chains: int = 0) -> tuple[list[dict], dict]:
+                chains: int = 0,
+                warm: Optional[dict] = None,
+                prewarm: bool = False) -> tuple[list[dict], dict]:
     """TEST (JEV_EXPAND=1): follow names outward from the skills Jev kept.
     chains > 0 is the narrow mode of the fast probe: one Jev call picks the
     `chains` best names of the start code. Each name starts one chain. A
@@ -1634,6 +1640,15 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
         if want is not None:
             want.add(name)
             return None
+        if warm and name in warm and name not in grep_cache:
+            # searched ahead, while the seeds were being scored: same
+            # search, same result, taken from there
+            grep_cache[name] = warm[name]
+            with _glock:
+                greps += 1
+            if memory is not None:
+                memory.note_word(name, "system",
+                                 (warm[name] or {}).get("total_matched", 0))
         if name not in grep_cache:
             with _glock:
                 greps += 1
@@ -1924,6 +1939,21 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
             "desc": s.get("description") or "",
             "start": True,
         })
+    if prewarm:
+        # Search ahead: only the name searches of the first hop, for every
+        # candidate, while the judge is still scoring them. A body's names
+        # do not depend on the other bodies, so the kept seeds find their
+        # searches done. Nothing is judged here.
+        want = set()
+        for n in level:
+            _candidates(n)
+        _names = [x for x in want if x not in grep_cache]
+        want = None
+        if _names:
+            with ThreadPoolExecutor(max_workers=int(
+                    os.environ.get("JEV_GREP_CONCURRENCY", "16"))) as ex:
+                list(ex.map(_grep, _names))
+        return [], {"warm": grep_cache, "secs": round(time.time() - t0, 2)}
     _fill_descriptions(org_redis, level)
     seen = {(n["file"], n["symbol"], n["line"]) for n in level}
     claimed: set = set()       # narrow mode: places already given to a chain
@@ -2510,8 +2540,11 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
 
         # Final decision with the whole picture: every open step that was
         # followed is judged once more, now also seeing what it led to.
+        # JEV_FINAL_PASS=0 (speed test): no second judgment. Open steps
+        # keep their first verdict; the helper rule below still applies.
         again = [c for c in held if c.get("expanded") and not use_llm_judge
-                 and not chains]
+                 and not chains
+                 and os.environ.get("JEV_FINAL_PASS", "1") == "1"]
 
         def _final(c: dict) -> None:
             led = [o for o in (c.get("kids") or []) + (c.get("also") or [])
@@ -2838,9 +2871,37 @@ async def _gather_evidence(question: str, org_redis, org_redis_binary, as_of,
 
     # 2. Jev scores the candidates against the question.
     yield "status", "Scoring skills with Jev..."
+    # JEV_SEARCH_AHEAD=1: the first hop's name searches run for every
+    # candidate while the judge scores them. Default 0 = as before.
+    _warm: dict = {}
+    _warm_threads: list = []
+
+    def _search_ahead(cands: list[dict]) -> None:
+        if (os.environ.get("JEV_SEARCH_AHEAD", "0") != "1"
+                or os.environ.get("JEV_EXPAND", "1") != "1"):
+            return
+        seeds = [{"def_key": c["dk"], "file_path": c["p"][0],
+                  "symbol": c["p"][1], "hit": None,
+                  "code": _split_guard(c["body"])[1]}
+                 for c in cands if c["body"]]
+
+        def _run():
+            try:
+                _x, _i = _jev_expand(question, org_redis, seeds,
+                                     as_of=as_of, prewarm=True)
+                _warm.update(_i.get("warm") or {})
+                print(f"⏱  searched ahead: {len(_warm)} names in "
+                      f"{_i['secs']}s, while the seeds were scored")
+            except Exception as e:
+                print(f"⚠️  search ahead failed: {_scrub(str(e))[:120]}")
+
+        t = threading.Thread(target=_run, daemon=True)
+        t.start()
+        _warm_threads.append(t)
+
     try:
         skills, _ji = await asyncio.to_thread(
-            _jev_select, question, org_redis, _pre_ids, as_of)
+            _jev_select, question, org_redis, _pre_ids, as_of, _search_ahead)
         info["select"] = _ji
         if _pre_ids and skills:
             # Where the kept seeds sat in the embedding ranking: tells whether
@@ -2873,9 +2934,11 @@ async def _gather_evidence(question: str, org_redis, org_redis_binary, as_of,
         yield "status", "Following names from the kept skills..."
         try:
             _jev_mem = JevMemory(question, skills, target)
+            for _t in _warm_threads:
+                await asyncio.to_thread(_t.join)   # the searches ahead are done
             _extra, _xi = await asyncio.to_thread(
                 _jev_expand, question, org_redis, skills,
-                memory=_jev_mem, as_of=as_of)
+                memory=_jev_mem, as_of=as_of, warm=_warm)
             skills = skills + _extra
             _jev_mem.add_seen(_extra)
             _start_leads = _jev_mem.new_leads(_xi.get("leads") or [])
