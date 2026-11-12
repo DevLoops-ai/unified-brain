@@ -422,7 +422,21 @@ def _knn_candidates(question, org_redis_binary, *, embedding, top_k,
         if embedding is None:
             if not question:
                 return []
-            embedding = emb.embed([question], "query")[0]
+            # QUESTION_VECTOR_CACHE=1: the vector of a question is stored the
+            # first time it is asked (per embedding model) and read back
+            # after that, so a repeated question makes no embedding call.
+            _qkey = ("qvec:" + emb.prefix + ":" + emb.model + ":"
+                     + hashlib.sha256(question.encode()).hexdigest())
+            _use_qc = os.environ.get("QUESTION_VECTOR_CACHE", "0") == "1"
+            _t_emb = time.time()
+            embedding = org_redis_binary.get(_qkey) if _use_qc else None
+            _hit = embedding is not None
+            if embedding is None:
+                embedding = emb.embed([question], "query")[0]
+                if _use_qc:
+                    org_redis_binary.set(_qkey, embedding)
+            print(f"🧭 question vector: {'stored' if _hit else 'embedded'} "
+                  f"in {time.time() - _t_emb:.2f}s")
         # Several chunk rows can belong to one skill, so k*8 rows may hold
         # fewer than k skills. Ask for more rows until k skills are found,
         # the scores fall under the cut, or the index has no more rows.
@@ -1927,12 +1941,19 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                           for x in bl[max(0, c["hit"] - 1): c["hit"] + 2]
                           if x.strip())[:300]
 
+    _conns = max(256, int(os.environ.get("JEV_CONCURRENCY", "64")))
     client = httpx.Client(
         timeout=60,
-        limits=httpx.Limits(max_connections=256, max_keepalive_connections=256),
+        limits=httpx.Limits(max_connections=_conns, max_keepalive_connections=_conns),
         headers={"Authorization":
                  f"Bearer {os.environ.get('OPENROUTER_API_KEY', '')}"})
     max_hops = int(os.environ.get("JEV_EXPAND_MAX_HOPS", "5"))
+    # JEV_FLAT=1 (speed mode, stage A): the first round judges hop 1 and
+    # hop 2 together. Hop 2 is reached without the judge choosing names:
+    # every body of hop 1 is expanded the way a seed is. That round has no
+    # triage and no budget cut. Later hops run as before.
+    flat = (os.environ.get("JEV_FLAT", "0") == "1" and not chains
+            and os.environ.get("CHAIN_JUDGE", "jev") != "llm")
     judge_target = memory.target if memory is not None else None
     use_llm_judge = os.environ.get("CHAIN_JUDGE", "jev") == "llm"
     # Jev takes hundreds of calls at once; the LLM judge keeps the low limit
@@ -2021,6 +2042,7 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                       f"follow={n.get('follow')} —" + _fmt_picks(picks))
         # budget is per hop, so a chain can go deeper than one hop
         while level and hops < max_hops and len(added) < max_add and used < max_chars:
+            _t_h = time.time()                 # timing only: start of this hop
             # All names of this hop are known now: note them, search the
             # new ones together, then build the candidates from the cache.
             want = None if chains else set()
@@ -2032,7 +2054,15 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                 with ThreadPoolExecutor(max_workers=int(
                         os.environ.get("JEV_GREP_CONCURRENCY", "16"))) as ex:
                     list(ex.map(_grep, _new))
+            _t_g = time.time()                 # timing only: end of the name searches
             per = [_candidates(n) for n in level]
+            _t_s, _tri = time.time(), 0.0      # timing only: end of the searches
+            _gt = skills_lib.grep_timing_take()
+            print(f"⏱  search detail: names {_t_g - _t_h:.2f}s ({len(_new)} new) · "
+                  f"candidates {_t_s - _t_g:.2f}s · inside the searches: "
+                  f"index {_gt['index']:.2f}s · load {_gt['load']:.2f}s "
+                  f"({_gt['bodies']} bodies) · check {_gt['check']:.2f}s "
+                  f"({_gt['kept']} kept), summed over parallel searches")
             cands: list[dict] = []
             # one candidate per node in turn, so every node gets a share of the budget
             for i in range(max((len(l) for l in per), default=0) if triage_on else per_node):
@@ -2063,13 +2093,66 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
             for n in level:
                 n["expanded"] = True
 
+            flat_now = flat and hops == 0
+            if flat_now:
+                # hop 2 without the judge: every hop-1 body is expanded the
+                # way a seed is (who mentions its file or symbol, the
+                # definitions of the names it uses, the build names near
+                # its link), and both hops are judged in one round
+                first = [c for c in cands if c.get("body")]
+                for c in first:
+                    c["depth"] = 1
+                want = set()
+                for c in first:
+                    _candidates(c)
+                _new = [x for x in want if x not in grep_cache]
+                want = None
+                if _new:
+                    with ThreadPoolExecutor(max_workers=int(
+                            os.environ.get("JEV_GREP_CONCURRENCY", "16"))) as ex:
+                        list(ex.map(_grep, _new))
+                per2 = [_candidates(c) for c in first]
+                for i in range(max((len(l) for l in per2), default=0)):
+                    for n, lst in zip(first, per2):
+                        if i >= len(lst):
+                            continue
+                        c = lst[i]
+                        k = (c["file"], c["symbol"], c["line"])
+                        if k in seen or not c["body"]:
+                            if k in by_key:
+                                n.setdefault("also", []).append(by_key[k])
+                            continue
+                        seen.add(k)
+                        by_key[k] = c
+                        lk = _link(n)
+                        step = (f"`{n['symbol']}` in {n['file']} ({n['why']}"
+                                + (f"; line: `{lk}`" if lk else "") + ")")
+                        c["chain"] = (f"{n['chain']}; then {step} "
+                                      "[reached, not judged yet]")
+                        c["trail"] = n["trail"] + [step]
+                        c["prev"] = n.get("prev", []) + [(
+                            f"`{n['symbol']}` in {n['file']}", n.get("desc") or "")]
+                        c["prev_code"] = n.get("prev_code", []) + (
+                            [(f"`{n['symbol']}` in {n['file']}", n["body"],
+                              n.get("hit"))] if n.get("body") else [])
+                        c["parent"] = n
+                        c["root_i"] = n.get("root_i")
+                        c["depth"] = 2
+                        cands.append(c)
+                for c in first:
+                    c["expanded"] = True
+                print(f"🛫 flat round: {len(first)} bodies at one link, "
+                      f"{len(cands) - len(first)} at two links, "
+                      f"{len(cands)} judged together")
+
             # Hit triage (JEV_HIT_TRIAGE, default on): a followed name found
             # in several places is first scanned in one call — coordinates and
             # the lines around each occurrence, judged against each other —
             # and only the places Jev would open are read in full.
             # Definitions and single places are read as before. Measured on
             # five open62541 questions: 3–8x fewer Jev calls, same answers.
-            if os.environ.get("JEV_HIT_TRIAGE", "1") == "1" and not use_llm_judge:
+            if (os.environ.get("JEV_HIT_TRIAGE", "1") == "1" and not use_llm_judge
+                    and not flat_now):
                 groups: dict = {}
                 for c in cands:
                     if c.get("reverse"):
@@ -2124,7 +2207,9 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
 
                 if work:
                     with ThreadPoolExecutor(max_workers=judge_workers) as ex:
+                        _t_t = time.time()
                         results = list(ex.map(_triage, work))
+                        _tri = time.time() - _t_t
                     scored += len(work)
                     triage_calls += len(work)
                     triage_skipped += sum(r[2] for r in results)
@@ -2146,14 +2231,16 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                     print(f"🔎 triage hop {hops + 1}: {before} candidates → {len(cands)} "
                           f"to read ({len(work)} triage calls)")
 
-            if len(cands) > budget:
+            if len(cands) > budget and not flat_now:
                 print(f"⚠️  hop {hops + 1}: {len(cands)} candidates, budget {budget}: "
                       f"{len(cands) - budget} not judged")
-            cands = cands[:budget]
+            if not flat_now:
+                cands = cands[:budget]
             if not cands:
                 break
-            hops += 1
+            hops += 2 if flat_now else 1
             _fill_descriptions(org_redis, cands)
+            _t_v = time.time()
             def _prep(c: dict):
                 """The Jev state of one candidate and the names it offers."""
                 lk = _link(c)
@@ -2294,7 +2381,11 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                             raw_v, _p = raw2, p2
                         derived = min(derived, derived2)
                 c["retry"] = retry.strip()
-                c["verdict"] = _settle(raw_v, _p)
+                # flat round: these bodies were reached without the judge
+                # choosing their name, so a reject stays a reject even when
+                # the judge is not sure
+                c["verdict"] = (raw_v if (flat_now and raw_v == "reject")
+                                else _settle(raw_v, _p))
                 c["verdict_raw"] = raw_v    # before _settle: a real continue vs an unsure reject
                 c["derived"] = derived
                 if derived > dmin:
@@ -2339,6 +2430,10 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                     list(ex.map(_judge_batch, groups.values()))
                 else:
                     list(ex.map(_judge, cands))
+            _t_e = time.time()
+            print(f"⏱  hop {hops}: search {_t_s - _t_h:.2f}s · triage {_tri:.2f}s · "
+                  f"verdicts {_t_e - _t_v:.2f}s ({len(cands)} calls) · "
+                  f"rest {(_t_e - _t_h) - (_t_s - _t_h) - _tri - (_t_e - _t_v):.2f}s")
             scored += len(cands)
             for c in cands:
                 if c.get("root_i") is not None:
@@ -2348,7 +2443,7 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
             tok_out += sum(c["toks"][1] for c in cands)
             cost += sum(c.get("cost") or 0 for c in cands)
             for c in cands:
-                print(f"🌱 expand hop {hops}: {c.get('verdict')} {c['file']} "
+                print(f"🌱 expand hop {c.get('depth', hops)}: {c.get('verdict')} {c['file']} "
                       f"`{c['symbol']}` ({c['why']}) "
                       f"follow={c.get('follow')} — {c.get('reason')}")
                 decisions.append({
@@ -2439,7 +2534,9 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
 
         if again:
             with ThreadPoolExecutor(max_workers=judge_workers) as ex:
+                _t_f = time.time()
                 list(ex.map(_final, again))
+                print(f"⏱  final pass: {time.time() - _t_f:.2f}s ({len(again)} calls)")
             scored += len(again)
             cost += sum(c.get("cost") or 0 for c in again)
             for c in again:
@@ -2847,7 +2944,11 @@ async def _ask_internal_stream(req: AskRequest, max_tokens: int = 27000):
             model        = target.model,
             api_key      = target.api_key,
             api_base     = target.api_base,
+            # WRITER_REASONING=none: the writer answers without thinking
+            # first (speed mode). Default "high", as before.
             extra_params = ({} if target.provider == "anthropic"
+                            else _no_think_params(target)
+                            if os.environ.get("WRITER_REASONING", "high") == "none"
                             else {"reasoning_effort": "high",
                                   "allowed_openai_params": ["reasoning_effort"]}),
         )

@@ -84,6 +84,27 @@ CODE_EMBED_TEXT_CAP_CHARS = 90_000
 
 
 import time as _time
+import threading as _threading
+
+# Timing only: where the seconds of a code search go. Summed over the
+# searches that run at the same time, read and reset once per hop.
+GREP_TIMING = {"index": 0.0, "load": 0.0, "check": 0.0,
+               "bodies": 0, "kept": 0, "greps": 0}
+_GREP_TIMING_LOCK = _threading.Lock()
+
+def _grep_time(part=None, secs=0.0, **counts):
+    with _GREP_TIMING_LOCK:
+        if part:
+            GREP_TIMING[part] += secs
+        for k, v in counts.items():
+            GREP_TIMING[k] += v
+
+def grep_timing_take() -> dict:
+    with _GREP_TIMING_LOCK:
+        out = dict(GREP_TIMING)
+        for k in GREP_TIMING:
+            GREP_TIMING[k] = 0.0 if isinstance(GREP_TIMING[k], float) else 0
+        return out
 from openai import APIError, APIConnectionError, RateLimitError, InternalServerError
 
 def _embed_with_retry(openai_client: OpenAI, texts: list[str], max_retries: int = 5,
@@ -1134,10 +1155,15 @@ def _iter_ft_candidates(redis: redis_lib.Store, query: dict, batch: int = 500,
     """Every candidate record (def_key, file, symbol, struct_type, line,
     body), filtered by struct type when the query asks for it."""
     wanted = query.get("struct_types")
-    for key in _iter_ft_keys(redis, query, index):
+    _t0 = _time.time()
+    _keys = list(_iter_ft_keys(redis, query, index))
+    _grep_time("index", _time.time() - _t0)
+    for key in _keys:
+        _t0 = _time.time()
         h = redis.hgetall(key)
         d = {(k.decode() if isinstance(k, bytes) else k):
              (v.decode() if isinstance(v, bytes) else v) for k, v in h.items()}
+        _grep_time("load", _time.time() - _t0, bodies=1)
         if wanted and d.get("struct_type") not in wanted:
             continue
         if with_key:
@@ -1341,6 +1367,7 @@ def grep_code_ft(
     query = _build_prefilter_query(pattern, is_regex, struct_types)
     if query is None:
         return None
+    _grep_time(greps=1)
 
     rx = re.compile(pattern) if is_regex else None
     file_suffix = file.lstrip("./") if file else None
@@ -1474,7 +1501,10 @@ def grep_code_ft(
         if as_of is not None and (d.get("file"), d.get("symbol")) in covered:
             continue
         body = d.get("body", "")
-        if rx.search(body) if rx else (pattern in body):
+        _t0 = _time.time()
+        _hit = rx.search(body) if rx else (pattern in body)
+        _grep_time("check", _time.time() - _t0, kept=1 if _hit else 0)
+        if _hit:
             if not _admit(d, is_hist=False):
                 continue
             matched += 1
