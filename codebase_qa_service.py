@@ -703,6 +703,16 @@ JEV_MODEL = os.environ.get("JEV_MODEL", "typesafe/jev-1.13")   # or cloudflare/c
 # the seed scoring and the hit triage. Empty = same model as JEV_MODEL.
 JEV_SELECT_MODEL = os.environ.get("JEV_SELECT_MODEL") or JEV_MODEL
 JEV_TRIAGE_MODEL = os.environ.get("JEV_TRIAGE_MODEL") or JEV_MODEL
+# Optional judge for the final pass: few calls, and each decides whether a
+# lead reaches the writer. Empty = same model as JEV_MODEL.
+JEV_FINAL_MODEL = os.environ.get("JEV_FINAL_MODEL") or JEV_MODEL
+# Optional judge for the local verdict (the second look at a rejected body,
+# on the lines around the link). Empty = same model as JEV_MODEL.
+JEV_LOCAL_MODEL = os.environ.get("JEV_LOCAL_MODEL") or JEV_MODEL
+# Lines of a place the triage sees: this many each side of the line that
+# names the followed name, or the first 2x this many lines of a definition.
+# 3 = the behaviour so far (7 lines around a mention, first 6 of a definition).
+JEV_TRIAGE_AROUND = int(os.environ.get("JEV_TRIAGE_AROUND", "3"))
 # Optional judge for the second opinion on a chain verdict that fell just
 # over the reject cut. A small model repeats its own number, so asking it
 # twice tells nothing (Q4 2026-11-10: seven retries, seven identical).
@@ -941,10 +951,11 @@ def _fmt_probs(probs) -> str:
     return " ".join(f"{k}={float(v):.2f}" for k, v in (probs or {}).items())
 
 
-def _jev_verdict(client, state: dict, instructions: str):
+def _jev_verdict(client, state: dict, instructions: str,
+                 model: str | None = None):
     """One Jev choice call: accept / continue / reject.
     Returns (verdict or None, probability per verdict, cost)."""
-    payload = {"model": JEV_MODEL, "state": state,
+    payload = {"model": model or JEV_MODEL, "state": state,
                "questions": {"v": {"type": "choice",
                                    "instructions": instructions,
                                    "criteria": _JEV_VERDICTS}}}
@@ -1264,7 +1275,7 @@ def _fmt_picks(picks: dict) -> str:
     return (" names: " + " ".join(f"{n}={p:.2f}" for n, p in top)) if top else ""
 
 
-def _jev_triage_hits(client, state: dict, hits: list[dict], around: int = 3):
+def _jev_triage_hits(client, state: dict, hits: list[dict], around: int = JEV_TRIAGE_AROUND):
     """One Jev call over the places a followed name was found, before any of
     them is read in full: like a developer scanning search results. `state`
     carries the question, the chain so far and the name. Each hit is shown
@@ -1379,6 +1390,20 @@ def _jev_verdict_names(client, state: dict, instructions: str,
                              "file, a script or a function — that should be "
                              "read to answer the `question`?"),
         }
+    # JEV_LOCAL_VERDICT=1: a second verdict on the lines around the link
+    # alone. One verdict for a whole large file hides a few relevant lines
+    # (CMakeLists.txt, Q1 2026-11-11: 90,000 chars, rejected; the lines
+    # around `crc64_x86.S` answer the question).
+    ask_local = extra is not None and bool(extra.get("around"))
+    if ask_local:
+        state = {**state, "code_around_link": extra["around"]}
+        questions["local"] = {
+            "type": "noul",
+            "instructions": ("Look only at `code_around_link`: the lines of "
+                             "`code` around the line it was reached by. Are "
+                             "these lines evidence that helps answer the "
+                             "`question`?"),
+        }
     as_choice = _names_as_choice() and bool(names)
     if as_choice:
         # One question: which name from `code` should be searched next?
@@ -1436,6 +1461,9 @@ def _jev_verdict_names(client, state: dict, instructions: str,
             if ask_sign:
                 sg = (answers.get("signpost") or {}).get("noul")
                 extra["signpost"] = float(sg) if sg is not None else 0.0
+            if ask_local:
+                lc = (answers.get("local") or {}).get("noul")
+                extra["local"] = float(lc) if lc is not None else 0.0
             d = (answers.get("derived") or {}).get("noul")
             return (ans["choice"], ans.get("probabilities") or {},
                     float((data.get("usage") or {}).get("cost") or 0), picks,
@@ -2077,7 +2105,7 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                     near = [i for i, p in probs.items()
                             if band > 0 and cut - band <= p < cut]
                     if near:
-                        p2, c2 = _jev_triage_hits(client, st, [g[i] for i in near], around=3)
+                        p2, c2 = _jev_triage_hits(client, st, [g[i] for i in near], around=JEV_TRIAGE_AROUND)
                         c_ += c2
                         moved = []
                         for j, i in enumerate(near):
@@ -2162,6 +2190,27 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                     raw_v, _p, c["cost"], picks, derived = _jev_verdict_names(
                         client, state, instructions, pool, more)
                     c["sign"] = more.get("signpost")
+                    if (os.environ.get("JEV_LOCAL_VERDICT", "0") == "1"
+                            and c.get("hit") is not None and raw_v == "reject"):
+                        # The whole body was rejected. The same question with
+                        # the same three answers is asked on the lines around
+                        # the link alone, in a call of its own so it cannot
+                        # colour the first answer. Accept or continue replaces
+                        # the reject, and the writer gets those lines.
+                        _bl = c["body"].splitlines()
+                        _lw = int(os.environ.get("JEV_LOCAL_WINDOW", str(window)))
+                        c["around"] = "\n".join(
+                            _bl[max(0, c["hit"] - _lw): c["hit"] + _lw + 1])
+                        lv, lp, lcost = _jev_verdict(
+                            client, {**state, "code": c["around"]}, instructions,
+                            JEV_LOCAL_MODEL)
+                        c["cost"] += lcost
+                        if lv is not None:
+                            c["local"] = 1.0 - float(lp.get("reject", 0))
+                            if lv in ("accept", "continue"):
+                                raw_v, _p = lv, lp
+                                c["excerpt"], c["cut"] = c["around"], True
+                                c["local_used"] = True
                     _apply(c, raw_v, _p, picks, derived, state, pool)
 
             def _judge_batch(group: list[dict]) -> None:
@@ -2253,6 +2302,10 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                     # elsewhere: a dead end, whatever the verdict said
                     c["verdict"] = c["verdict_raw"] = "reject"
                 c["probs"], c["picks"] = _p, picks
+                # JEV_LOCAL_VERDICT=1: set in _judge when the verdict came
+                # from the lines around the link (for the log line below).
+                loc = c.get("local")
+                local_yes = bool(c.get("local_used"))
                 # the names Jev said yes to are searched in the next hop
                 c["follow"], c["toks"] = _picked(picks), (0, 0)
                 # not evidence, but it points somewhere: the judge said
@@ -2266,10 +2319,15 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                     and sign >= float(os.environ.get("JEV_SIGNPOST_MIN", "0.4")))
                 c["reason"] = (_fmt_probs(_p)
                                + (" (not sure: continue)"
-                                  if raw_v != c["verdict"] else "")
+                                  if raw_v != c["verdict"] and not local_yes
+                                  else "")
                                + f" derived={derived:.2f}"
                                + (f" signpost={sign:.2f}"
                                   if sign is not None else "")
+                               + (f" local={loc:.2f}"
+                                  + (" (verdict from the lines around the link)"
+                                     if local_yes else "")
+                                  if loc is not None else "")
                                + retry
                                + _fmt_picks(picks))
 
@@ -2360,14 +2418,16 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                 "description": c.get("desc") or "",
                 "code": c["excerpt"],
             })
-            raw_v, _p, c["cost"] = _jev_verdict(client, st, instructions)
+            raw_v, _p, c["cost"] = _jev_verdict(client, st, instructions,
+                                                JEV_FINAL_MODEL)
             sure = float(os.environ.get("JEV_SURE_REJECT", "0.75"))
             c["final_retry"] = ""
             if raw_v == "reject" and _just_over(_p.get("reject"), sure):
                 # a sure reject by a hair drops the lead for good: ask once
                 # more, keep the call with the lower reject
                 st["led_to"] = st["led_to"]      # same state, second opinion
-                raw2, p2, cost2 = _jev_verdict(client, st, instructions)
+                raw2, p2, cost2 = _jev_verdict(client, st, instructions,
+                                               JEV_FINAL_MODEL)
                 c["cost"] += cost2
                 if raw2 is not None:
                     c["final_retry"] = (f"retry: reject {float(_p.get('reject', 0)):.2f}"
