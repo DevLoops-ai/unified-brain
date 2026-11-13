@@ -211,6 +211,10 @@ Trap: `memlimit_threading` never produces `LZMA_MEMLIMIT_ERROR`.
 
 > Under what exact conditions can xz delete the original input file after compression or decompression, and what checks can prevent that deletion?
 
+Inclusive version:
+
+Under what exact conditions can xz delete the original input file after compression or decompression, and what checks can prevent that deletion, including files that xz refuses to process at all?
+
 Reference points (`src/xz/file_io.c`, `src/xz/coder.c`, `src/xz/args.c`):
 
 1. Deletion happens in `io_close_src()`: only if `success` is true, the

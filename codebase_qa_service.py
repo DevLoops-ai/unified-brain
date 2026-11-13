@@ -539,6 +539,39 @@ def _evidence_index(skills: list[dict]) -> str:
     return "\n".join(lines)
 
 
+_MARKER_RE = re.compile(
+    r"^(?P<c>\S+) … lines (?P<lo>\d+)-(?P<hi>\d+) elided by DevLoops "
+    r"\((?P<d>.*)\) …$", re.M)
+_MARKER_ITEM_RE = re.compile(r"^(?P<n>.+?) \[(?P<t>[^\]]+)\] @(?P<l>\d+)$")
+
+
+def _plain_markers(code: str, file_path: str, where: dict) -> str:
+    """QA_PLAIN_MARKERS=1: a file-level body is stored without the lines of
+    its functions; the ingester leaves a marker there. For the writer the
+    marker is rewritten to say what those lines are and where their body is
+    in this evidence (or that it is not included). A marker for blank lines
+    becomes a blank line."""
+    def _one(m):
+        d = m.group("d")
+        if d == "blank":
+            return ""
+        if not d.startswith("extracted as separate symbols: "):
+            return m.group(0)
+        items = []
+        for it in d[len("extracted as separate symbols: "):].split(", "):
+            mi = _MARKER_ITEM_RE.match(it)
+            if not mi:
+                items.append(it)
+                continue
+            i = where.get((file_path, mi.group("n")))
+            items.append(f"`{mi.group('n')}` ({mi.group('t')}, line {mi.group('l')}): "
+                         + (f"its full body is shown as evidence {i}" if i
+                            else "its body is not in this evidence"))
+        return (f"{m.group('c')} lines {m.group('lo')}-{m.group('hi')} of this file "
+                f"are stored as separate bodies — " + "; ".join(items))
+    return _MARKER_RE.sub(_one, code)
+
+
 def _build_context(skills: list[dict], shown_bodies: Optional[dict] = None) -> str:
     # identical text once: the first copy stays, the others become a note on it
     firsts: dict[str, dict] = {}
@@ -555,6 +588,9 @@ def _build_context(skills: list[dict], shown_bodies: Optional[dict] = None) -> s
         print(f"✍️  context: {len(skills) - len(kept)} duplicate bod(ies) folded")
     skills = _order_for_writer(kept)
     parts = [_evidence_index(skills)] if len(skills) > 1 else []
+    _plain = os.environ.get("QA_PLAIN_MARKERS", "0") == "1"
+    _where = {(s.get("file_path") or "", s.get("symbol") or ""): i
+              for i, s in enumerate(skills, 1)}
     for i, s in enumerate(skills, 1):
         tag = " [PLANNED — not yet implemented]" if s["suggested"] else ""
         if s.get("is_obsolete"):
@@ -584,7 +620,9 @@ def _build_context(skills: list[dict], shown_bodies: Optional[dict] = None) -> s
                 body += ("\n\n**Source code:** (body already shown this session — "
                          f"see the earlier occurrence for {s['file_path']}; do not re-request)")
             else:
-                body += f"\n\n**Source code:**\n```typescript\n{s['code'].rstrip()}\n```"
+                _code = (_plain_markers(s["code"], s.get("file_path") or "", _where)
+                         if _plain else s["code"])
+                body += f"\n\n**Source code:**\n```typescript\n{_code.rstrip()}\n```"
         elif s.get("is_composite"):
             body += "\n\n**Source code:** (composite — no single body)"
         else:
@@ -898,9 +936,19 @@ def _jev_select(question: str, org_redis,
     firsts = [g[0] for g in by_text.values()]
     also_map = {g[0]["dk"]: [c["dk"] for c in g[1:]]
                 for g in by_text.values() if len(g) > 1}
+    # JEV_SEED_SCORING=0 (test): no judge call for the candidates of the
+    # embedding search. Each one is taken as a seed, in the search's order.
+    _no_scoring = (only_ids is not None
+                   and os.environ.get("JEV_SEED_SCORING", "1") == "0")
     try:
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            list(ex.map(_score, firsts))
+        if _no_scoring:
+            for c in firsts:
+                c["score"], c["cost"] = min_score, 0.0
+            print(f"🎯 Jev select: scoring is off, all {len(firsts)} "
+                  f"candidates are seeds")
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as ex:
+                list(ex.map(_score, firsts))
     finally:
         client.close()
     for g in by_text.values():
@@ -1318,6 +1366,11 @@ def _jev_triage_hits(client, state: dict, hits: list[dict], around: int = JEV_TR
         h = c.get("hit")
         if h is None:
             ctx = "\n".join(bl[:around * 2])
+            if c.get("tnames"):
+                # JEV_TRIAGE_NAMES=1: the first lines of a definition say
+                # little; the names its whole body uses show where it leads
+                ctx += ("\nnames used in the whole body: "
+                        + ", ".join(c["tnames"]))
         else:
             lo, hi = max(0, h - around), min(len(bl), h + around + 1)
             ctx = "\n".join(f"{c['line'] + j}: {bl[j]}" for j in range(lo, hi))
@@ -2222,6 +2275,13 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                                            "the names this body uses; each place "
                                            "below defines one of them"),
                     })
+                    # JEV_TRIAGE_NAMES=1: each definition is shown with the
+                    # names its whole body uses (the same list the full read
+                    # gets), not only its first lines. Default 0 = as before.
+                    if os.environ.get("JEV_TRIAGE_NAMES", "0") == "1":
+                        for c in g:
+                            if c.get("hit") is None and "tnames" not in c:
+                                c["tnames"] = _name_pool(org_redis, c)
                     probs, c_ = _jev_triage_hits(client, st, g)
                     if not probs:
                         return name, len(g), 0, c_, n.get("root_i")
@@ -2268,6 +2328,17 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                                           "name": name, "places": total,
                                           "skipped": skipped})
                     before = len(cands)
+                    # JEV_TRIAGE_REOPEN=1: a place the triage skipped under one
+                    # name stays open to a later link. Without it the place
+                    # counts as already read, and a name the judge then chooses
+                    # to follow finds nothing (xz Q7: `io_open_src_real`,
+                    # skipped under `TUKLIB_DOSLIKE`). Default 0 = as before.
+                    if os.environ.get("JEV_TRIAGE_REOPEN", "0") == "1":
+                        for c in cands:
+                            if id(c) in dropped:
+                                _k = (c["file"], c["symbol"], c["line"])
+                                seen.discard(_k)
+                                by_key.pop(_k, None)
                     cands = [c for c in cands if id(c) not in dropped]
                     if triage_defs:
                         # highest triage probability first; untriaged places keep their rank
@@ -3105,6 +3176,13 @@ async def _ask_internal_stream(req: AskRequest, max_tokens: int = 27000):
     # 4. One call writes the answer from the gathered bodies.
     try:
         print(f"✍️  writing: {len(skills)} bodies, {len(context)} chars of context")
+        # QA_DUMP_CONTEXT=<file path> (empty = off): the evidence text the
+        # writer receives is also saved to that file, to inspect one run.
+        _dump = os.environ.get("QA_DUMP_CONTEXT", "")
+        if _dump:
+            with open(_dump, "w", encoding="utf-8") as _f:
+                _f.write(context)
+            print(f"✍️  writer input saved to {_dump}")
         yield _sse_event({"type": "status", "message": "Writing answer..."})
         _t_w0, _t_first, _answer_text = time.time(), None, []
         async for event in _final_answer_stream(

@@ -191,6 +191,27 @@ class CodeEmbedder:
                                       self.model, self.dims)
         if input_type == "query":
             batch = [QWEN_QUERY_INSTRUCT + t for t in batch]
+            # QUERY_EMBED_OLLAMA=<model name> (empty = off, as before): the
+            # question's vector is computed on this machine by Ollama. Stored
+            # vectors and ingestion are not touched.
+            import os
+            _local = os.environ.get("QUERY_EMBED_OLLAMA", "")
+            if _local and self.name == "qwen":
+                try:
+                    import httpx
+                    r = httpx.post(
+                        os.environ.get("OLLAMA_URL", "http://localhost:11434")
+                        + "/api/embed",
+                        json={"model": _local, "input": batch}, timeout=30)
+                    r.raise_for_status()
+                    vecs = r.json()["embeddings"]
+                    if all(len(v) == self.dims for v in vecs):
+                        return vecs
+                    print(f"⚠️  local question vector has {len(vecs[0])} numbers, "
+                          f"the store needs {self.dims}: using the hosted model")
+                except Exception as e:
+                    print(f"⚠️  local question vector failed "
+                          f"({type(e).__name__}): using the hosted model")
         resp = _embed_with_retry(self.client, batch, model=self.model)
         return [d.embedding for d in resp.data]
 
