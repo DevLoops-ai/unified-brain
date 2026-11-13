@@ -2,11 +2,30 @@
 
 **Persistent memory for System One coding agents, by [DevLoops](https://devloops.ai).**
 
-On 24/10/2026 I have published as OSS a framework I call unified-brain: evidence gathering that is fast and cheap, and as accurate as a frontier coding agent. On the same nine-question, 74-point xz benchmark (`evals/questions/xz.md`) it has two measured profiles (`env.example`): **coverage** scores 94.6 % (70 / 74) — equal to a Claude Opus 5.5 agent and above a Claude Fable 5.1 agent (69 / 74) — and **cheap** scores 92.9 % (68.75 / 74) at 1/27 of Opus's and 1/69 of Fable's cost (prompt caching on for the agents), 2.3× and 3.4× faster. It started at 86.5% on 29/10; every retrieval change on the way is written up in `evals/results/`. The evaluator is done by a decision judge model (Jev, or the open-weights pplx-decider in the cheap profile), not by the writer model that can be anything you want.
+On 24/10/2026 I have published as OSS a framework I call unified-brain: evidence gathering that is fast and cheap, and close to a frontier coding agent in accuracy. On the same nine-question, 74-point xz benchmark (`evals/questions/xz.md`) it has four measured profiles (`env.example`). The strongest agent I have measured is Claude Fable 5.2 at max reasoning effort: 72.75 / 74, in 5,372 s, for about $50 (`evals/results/qa-xz-2026-11-13-fable-5-2-agents.md`). Against it:
+
+| Profile | Score | Share of Fable 5.2 max's points | Cost, nine questions | Cheaper by | Time, nine questions | Faster by |
+|---|---|---|---|---|---|---|
+| **Full** | 70 / 74 | 96 % | $0.660 for six questions ¹ | about 50× ¹ | 435 s for six questions ¹ | 8.6× ¹ |
+| **Cheap** | 68.75 / 74 | 94.5 % | $0.253 | about 196× | 519 s | 10.4× |
+| **Hybrid-reliable** | 66.5 / 74 | 91.4 % | $0.135 | about 367× | 396 s | 13.6× |
+| **Ultra-fast local** | 62.0 / 74 | 85.2 % | $0.161 | about 308× | 90.7 s | 59× |
+| Claude Fable 5.2, max effort | 72.75 / 74 | — | about $50 (estimated) | — | 5,372 s | — |
+
+¹ The Full run has complete footers for six of the nine questions (Q1, Q2, Q3, Q7, Q8, Q9). Its cost and time are compared with Fable 5.2 on those same six: about $33.21 and 3,752 s.
+
+How to read the table:
+
+- Fable 5.2's cost is an estimate from the tokens the harness reported, at list prices with prompt caching on ($42 to $57 for the nine; the table uses the middle). It is not a bill, and thinking tokens are not counted, so it is more likely too low than too high. Our costs are measured from the answer footers.
+- Full and Cheap were measured on xz at `45d08abc` with the writer on Fireworks; Hybrid-reliable, Ultra-fast local and Fable 5.2 on xz at `7baf6835`, ours with the writer on Isoquant, which is cheaper.
+- Ultra-fast local is the Jev-judge run of 2026-11-13; its eval file is not in `evals/results/` yet. The same profile with the pplx judges is (`qa-xz-2026-11-13-ultrafast-local-k40-pplx.md`: 62.25 / 74, $0.065, 12.1 s per answer).
+- One run per question for every row, and one grader (Claude Fable) for all of them.
+
+Full also equals a Claude Opus 5.5 agent (70 / 74) and is above a Claude Fable 5.1 agent (69 / 74), both at high effort (`qa-xz-2026-10-29.md`). It started at 86.5% on 29/10; every retrieval change on the way is written up in `evals/results/`. The evaluator is done by a decision judge model (Jev, or the open-weights pplx-decider), not by the writer model that can be anything you want.
 
 The writer is a totally separate phase that works in one go.
 
-The magic sauce is an intermediary OS (SQLITE) memory layer that facilitates retrieval, filtering and judging through a System One decision model — by default pplx-decider, an open-weights 27B (Apache-2.0); Jev, a proprietary one, in the coverage profile.
+The magic sauce is an intermediary OS (SQLITE) memory layer that facilitates retrieval, filtering and judging through a System One decision model — depending the profile, pplx-decider, an open-weights 27B (Apache-2.0), pplx-flash or Jev, a proprietary one, in the coverage profile.
 
 The agent spawned from unified-brain runs through MCP on Cursor, OpenCode or Claude Code etc. allowing you to use it through your favorite harness.
 
@@ -263,42 +282,6 @@ Claude Code — the same object in `.mcp.json`. The tool takes 20–60 seconds
 The service also answers plain HTTP for scripts: `POST /api/retrieve`,
 `GET /api/grep`, `/api/symbol/{name}`, `/api/body`, `/api/history`,
 `/api/commit/{hash}`.
-
-### What a question costs
-
-Measured with the two profiles in `env.example` (the cheap one is the
-default):
-
-- Cheap profile (pplx-decider, knn top-20, definitions triage), xz: judge
-  $0.003–0.021 per question (35–204 judge calls), plus the writer $0.007–
-  0.028 on DeepSeek V4.1 Flash (19–107k tokens in, 3–20k out, most of it
-  thinking before the first word) — $0.01–0.05 and 40–120 s per answer,
-  the time set by the writer.
-- Coverage profile (Jev, knn top-400): judge $0.05–0.11 per xz question,
-  about 3× the cheap profile; the fixed scoring step alone is 400 calls
-  ($0.036 on xz, $0.014 on open62541 — xz's bodies carry more tokens).
-  open62541 hard tracing questions: Jev $0.07–0.09 in 15 s.
-- Vague questions ("what is this library for?") are cheaper on the judge
-  — but they get the documentation's view of the code, which can be stale
-  (xz's README still says threaded decompression is unimplemented).
-- One comparison so far, same question, same Cursor model, caches cold:
-  Cursor exploring on its own used 9% of a $20 plan; with unified-brain
-  2% plus $0.12 of Jev. The question set is `/evals`;
-  the Cursor answers themselves are not in the repo.
-- Nine xz questions, 74 reference points, against Claude Opus 5.5 and
-  Fable 5.1 agents with shell access (one run each, prompt caching on):
-  unified-brain coverage profile 70 / 74 (run f, 2026-11-05; the last
-  Jev run with complete footers, run d, was 69 / 74 at $0.874 and
-  498 s); cheap profile 68.75 / 74 at $0.253 and 519 s
-  (`qa-xz-2026-11-06-pplx.md`); the first run on 2026-10-29 was 64 / 74
-  at $0.685. Opus 70 / 74 at $6.84 and 1,183 s; Fable 69 / 74 at $17.55
-  and 1,736 s. Grader: Fable 5.1, with the keys fixed before the runs.
-  Questions and keys in `evals/questions/xz.md`, one dated file per run
-  in `evals/results/`.
-
-Each answer ends with a line of these numbers for your own run. Part 2 of
-`env.example` lists the constants that move them; the ones we tested are
-noted there.
 
 ## How it is built
 
