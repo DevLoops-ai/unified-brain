@@ -749,7 +749,10 @@ def _sse_event(payload: dict) -> str:
 
 # ── API Models ─────────────────────────────────────────────────────────────────
 
-JEV_URL = "https://openrouter.ai/api/alpha/decisions"
+# JEV_URL / JEV_API_KEY: where the judge is called and with which key.
+# Not set = OpenRouter with OPENROUTER_API_KEY, as before.
+JEV_URL = os.environ.get("JEV_URL") or "https://openrouter.ai/api/alpha/decisions"
+JEV_KEY = os.environ.get("JEV_API_KEY") or os.environ.get("OPENROUTER_API_KEY", "")
 JEV_MODEL = os.environ.get("JEV_MODEL", "typesafe/jev-1.13")   # or cloudflare/clef-flash
 # Optional second judge for the two places where few calls decide a lot:
 # the seed scoring and the hit triage. Empty = same model as JEV_MODEL.
@@ -864,8 +867,7 @@ def _jev_select(question: str, org_redis,
         timeout=60,
         limits=httpx.Limits(max_connections=workers,
                             max_keepalive_connections=workers),
-        headers={"Authorization":
-                 f"Bearer {os.environ.get('OPENROUTER_API_KEY', '')}"})
+        headers={"Authorization": f"Bearer {JEV_KEY}"})
 
     def _score(c: dict) -> None:
         payload = {
@@ -1003,6 +1005,8 @@ def _jev_select(question: str, org_redis,
 
 
 _NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{3,}")
+# JEV_NAMES_ALL=1: a name of any length (`id`, `url`, `len`).
+_NAME_ANY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # a name in member position: `->name` or `.name`
 _MEMBER_RE = re.compile(r"(?:->|\.)\s*([A-Za-z_][A-Za-z0-9_]{3,})")
 
@@ -1261,16 +1265,24 @@ def _name_pool(org_redis, c: dict) -> list[str]:
     pool_max = int(os.environ.get("JEV_FOLLOW_POOL", "40"))
     body = c.get("body") or ""
     lines = body.splitlines()
+    # JEV_NAMES_ALL=1: every name of the body is offered, in the order it
+    # appears: no "first 200", no shape rule (underscore, length), no
+    # "first 40", and the whole body is read, not its first 20,000
+    # characters. Jev picks; a list too long for one choice question is
+    # asked in groups (_jev_verdict_names). 0 = as before.
+    all_names = os.environ.get("JEV_NAMES_ALL", "0") == "1"
     if c.get("hit") is not None:
         near = "\n".join(lines[max(0, c["hit"] - window): c["hit"] + window + 1])
     else:
-        near = body[:20000]
+        near = body if all_names else body[:20000]
     sym = c.get("symbol") or ""
     own = sym if sym and not sym.startswith("<") else ""
     toks: list[str] = []
-    for t in _NAME_RE.findall(near):
+    for t in (_NAME_ANY_RE if all_names else _NAME_RE).findall(near):
         if t != own and t not in toks:
             toks.append(t)
+    if all_names:
+        return toks
     toks = toks[:200]
     # Struct members read or written in this body (`pair->src_st`,
     # `strm.avail_in`). Not symbols, so the filter below drops them; yet
@@ -1433,9 +1445,72 @@ _DERIVED_INSTRUCTIONS = (
     "differs in it)? Answer no when the `question` asks about such copies.")
 
 
+# Options one Jev choice question can take.
+_JEV_MAX_CHOICES = 255
+
+
+# Jev takes 128 questions in one call. The call also carries the verdict
+# and a few other questions, so this many are left for part questions.
+_JEV_PART_ROOM = 120
+
+
+def _code_parts(n_lines: int) -> list[tuple[int, int]]:
+    """Cuts a body of n_lines into parts: (first line, last line), counted
+    from 1. The part length follows the body: the square root of its line
+    count, so a body of 100 lines gives 10 parts of 10 lines and one of
+    2,500 lines gives 50 parts of 50. Parts get longer only when there
+    would be more of them than one Jev call can ask about."""
+    if n_lines < 2:
+        return []
+    size = max(1, round(n_lines ** 0.5))
+    if -(-n_lines // size) > _JEV_PART_ROOM:
+        size = -(-n_lines // _JEV_PART_ROOM)
+    return [(a + 1, min(a + size, n_lines))
+            for a in range(0, n_lines, size)]
+
+
 def _jev_verdict_names(client, state: dict, instructions: str,
                        names: list[str], extra: dict | None = None,
                        model: str | None = None):
+    """_jev_verdict_names_one, for any number of names. A choice question
+    takes _JEV_MAX_CHOICES options and one of them is "(none of these)",
+    so a longer list is cut into groups of 254, one call per group, all
+    at once. Each group is its own distribution, so the picking rule
+    (_picked) is applied inside each group and the picked names are
+    joined: a share in one group says nothing next to a share in another.
+    The joined picks are returned on a scale where _picked keeps them all.
+    The verdict is the first group's (every call sees the same body)."""
+    room = _JEV_MAX_CHOICES - 1
+    if not _names_as_choice() or len(names) <= room:
+        return _jev_verdict_names_one(client, state, instructions, names,
+                                      extra, model)
+    groups = [names[i:i + room] for i in range(0, len(names), room)]
+    with ThreadPoolExecutor(max_workers=len(groups)) as ex:
+        res = list(ex.map(
+            lambda t: _jev_verdict_names_one(
+                client, state, instructions, t[1],
+                extra if t[0] == 0 else None, model),
+            enumerate(groups)))
+    first = res[0]
+    if first[0] is None:
+        return first
+    joined = {_NONE_NAME: 0.0}
+    cost = 0.0
+    for r in res:
+        if r[0] is None:
+            continue                 # this group's call failed: not followed
+        cost += r[2]
+        chosen = _picked(r[3])
+        if chosen:
+            top = max(r[3][n] for n in chosen)
+            for n in chosen:
+                joined[n] = r[3][n] / top
+    return first[0], first[1], cost, joined, first[4]
+
+
+def _jev_verdict_names_one(client, state: dict, instructions: str,
+                           names: list[str], extra: dict | None = None,
+                           model: str | None = None):
     """One Jev call, two kinds of questions on the same body: the
     accept/continue/reject verdict, and one yes/no per name (should this
     name be searched next?). Returns (verdict or None, verdict
@@ -1475,6 +1550,32 @@ def _jev_verdict_names(client, state: dict, instructions: str,
                              "these lines evidence that helps answer the "
                              "`question`?"),
         }
+        questions["rest"] = {
+            "type": "noul",
+            "instructions": ("`code_around_link` is one part of `code`. Is "
+                             "the rest of `code`, the part outside "
+                             "`code_around_link`, also needed to answer the "
+                             "`question`?"),
+        }
+    # JEV_LOCAL_VERDICT=3: one yes/no question per part of `code`. The
+    # code is sent once, with a "### part N" line above each part, so that
+    # Jev sees which lines a part holds.
+    ask_parts = extra is not None and bool(extra.get("parts"))
+    if ask_parts:
+        _pl = extra["parts"]
+        _cl = str(state.get("code") or "").splitlines()
+        state = {**state, "code": "\n".join(
+            f"### part {i + 1}\n" + "\n".join(_cl[a - 1:b])
+            for i, (a, b) in enumerate(_pl))}
+        for i in range(len(_pl)):
+            questions[f"part{i}"] = {
+                "type": "noul",
+                "instructions": (
+                    "The \"### part N\" lines in `code` are not part of "
+                    "the code; they only number its parts. Look at the "
+                    f"lines under \"### part {i + 1}\". Are these lines "
+                    "needed to answer the `question`?"),
+            }
     as_choice = _names_as_choice() and bool(names)
     if as_choice:
         # One question: which name from `code` should be searched next?
@@ -1515,7 +1616,7 @@ def _jev_verdict_names(client, state: dict, instructions: str,
         try:
             data = res.json()
         except ValueError:
-            return None, {}, 0.0, {}
+            return None, {}, 0.0, {}, 0.0
         answers = data.get("answers") or {}
         ans = answers.get("v") or {}
         if res.status_code == 200 and ans.get("choice") in _JEV_VERDICTS:
@@ -1535,6 +1636,15 @@ def _jev_verdict_names(client, state: dict, instructions: str,
             if ask_local:
                 lc = (answers.get("local") or {}).get("noul")
                 extra["local"] = float(lc) if lc is not None else 0.0
+                # no answer = the rest is needed (the whole body stays)
+                rs = (answers.get("rest") or {}).get("noul")
+                extra["rest"] = float(rs) if rs is not None else 1.0
+            if ask_parts:
+                # no answer for a part = it is needed (it stays)
+                extra["part_answers"] = [
+                    (lambda v: float(v) if v is not None else 1.0)(
+                        (answers.get(f"part{i}") or {}).get("noul"))
+                    for i in range(len(extra["parts"]))]
             d = (answers.get("derived") or {}).get("noul")
             return (ans["choice"], ans.get("probabilities") or {},
                     float((data.get("usage") or {}).get("cost") or 0), picks,
@@ -1658,8 +1768,28 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
     Returns (extra skills in _search_skills shape, info)."""
     min_score = float(os.environ.get("JEV_EXPAND_MIN_SCORE", "2.0"))
     budget    = budget or int(os.environ.get("JEV_EXPAND_BUDGET", "300"))     # Jev calls
+    # 0 = no limit.
+    if budget <= 0:
+        budget = float("inf")
     max_add   = max_add or int(os.environ.get("JEV_EXPAND_MAX_ADD", "200"))
     max_chars = int(os.environ.get("JEV_EXPAND_MAX_CHARS", "250000"))
+    # 0 in either one = no limit.
+    if max_add <= 0:
+        max_add = float("inf")
+    if max_chars <= 0:
+        max_chars = float("inf")
+    # Helpers (the "helper of evidence" rule below).
+    # JEV_HELPER_ORDER=1: attached from the highest accept number down, so
+    # that a limit cuts the weakest first. 0 = in the order they were found.
+    # JEV_HELPER_MIN_ACCEPT: a helper whose accept number is below this is
+    # not attached. 0 = no floor.
+    helper_order = os.environ.get("JEV_HELPER_ORDER", "0") == "1"
+    # JEV_NAMES_ALL=1: see _name_pool. Here it also lifts the same two
+    # limits of the blind route (first 20,000 characters, first 200 names)
+    # and turns off the blind text search of whole-file bodies, whose
+    # names Jev now picks.
+    names_all = os.environ.get("JEV_NAMES_ALL", "0") == "1"
+    helper_min   = float(os.environ.get("JEV_HELPER_MIN_ACCEPT", "0"))
     max_hits  = int(os.environ.get("JEV_EXPAND_MAX_HITS", "25"))    # more hits = name is everywhere
     # With the hit triage on, a common name is not dropped: every place is
     # fetched and the triage picks the ones to open. max_hits then only
@@ -1669,6 +1799,11 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
     # Groups of fewer places than this are read in full; from this size
     # on, the triage picks. 2 = every group (the behaviour so far).
     triage_from = int(os.environ.get("JEV_TRIAGE_FROM", "2"))
+    # JEV_TRIAGE_FROM_HOP: the hop at which that rule starts. 1 = every hop
+    # (the behaviour so far). 2 = at hop 1 the places next to the seeds are
+    # read in full; only a name found in more than max_hits places is still
+    # triaged there, because with the triage on such a name is not dropped.
+    triage_hop = int(os.environ.get("JEV_TRIAGE_FROM_HOP", "1"))
     max_defs  = int(os.environ.get("JEV_EXPAND_MAX_DEFS", "4"))
     per_node  = int(os.environ.get("JEV_EXPAND_PER_NODE", "30"))
     # JEV_TRIAGE_DEFS=1: the definitions a body uses are not read whole in
@@ -1825,10 +1960,11 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
         if n["hit"] is not None:
             near = "\n".join(lines[max(0, n["hit"] - window): n["hit"] + window + 1])
         else:
-            near = body[:20000]
+            near = body if names_all else body[:20000]
         base = os.path.basename(n["file"] or "")
         own = n["symbol"] if n["symbol"] and not n["symbol"].startswith("<") else ""
         out: list[dict] = []
+        picked_first = None      # set for a seed under JEV_SEED_NAMES=2
 
         if chains and n.get("follow") is not None:
             # Narrow mode. The start code opens `chains` chains, a later
@@ -1923,17 +2059,23 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
             # candidates handed in with the seed (composite members) go first.
             # With the triage on, every place of a chosen name goes through
             # (the triage picks); per_node bounds only the blind picks.
-            if triage_defs:
+            if n.get("blind_too"):
+                # JEV_SEED_NAMES=2: a seed. The names Jev picked go first,
+                # and the blind opening of definitions below still runs.
+                picked_first = list(n.get("extra") or []) + chosen
+            elif triage_defs:
                 return list(n.get("extra") or []) + chosen + out
-            if triage_on:
+            elif triage_on:
                 return list(n.get("extra") or []) + chosen + out[:per_node]
-            return list(n.get("extra") or []) + (chosen + out)[:per_node]
+            else:
+                return list(n.get("extra") or []) + (chosen + out)[:per_node]
 
         toks: list[str] = []
         for t in _NAME_RE.findall(near):
             if t != own and t not in toks:
                 toks.append(t)
-        toks = toks[:200]
+        if not names_all:
+            toks = toks[:200]
         counts = []
         if toks:
             pipe = org_redis.pipeline(transaction=False)
@@ -1943,7 +2085,8 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
 
         # (b) whole-file bodies: names next to the link that are not symbols
         #     (build switches, option names) -> who else mentions them
-        if n["struct"] in ("module", "blob") or (n["symbol"] or "").startswith("<"):
+        if (not names_all and
+                (n["struct"] in ("module", "blob") or (n["symbol"] or "").startswith("<"))):
             plain = [t for t, c in zip(toks, counts)
                      if c == 0 and "_" in t and len(t) >= 6][:12]
             for name in plain:
@@ -1962,7 +2105,12 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                 for d in defs:
                     out.append({**d, "hit": None,
                                 "why": f"it defines `{t}`, which is used there"})
-        return out if triage_defs else out[:per_node]
+        blind = out if triage_defs else out[:per_node]
+        if picked_first is None:
+            return blind
+        have = {(c["file"], c["symbol"], c["line"]) for c in picked_first}
+        return picked_first + [c for c in blind
+                               if (c["file"], c["symbol"], c["line"]) not in have]
 
     def _excerpt(body: str, hit: Optional[int]) -> tuple[str, bool]:
         return _jev_excerpt(body, hit, body_cap)
@@ -2033,9 +2181,17 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
     _conns = max(256, int(os.environ.get("JEV_CONCURRENCY", "64")))
     client = httpx.Client(
         timeout=60,
-        limits=httpx.Limits(max_connections=_conns, max_keepalive_connections=_conns),
-        headers={"Authorization":
-                 f"Bearer {os.environ.get('OPENROUTER_API_KEY', '')}"})
+        # JEV_KEEPALIVE: how many connections stay open after a call, to be
+        # used again by a later call. Not set = as before (all of them).
+        # 0 = none: every call opens its own connection and closes it.
+        # Measured 2026-11-13 with a test server that answers every call in
+        # 0.2 s: 245 calls at once, all kept open: slowest call 5.5 s (the
+        # later calls wait inside the HTTP library to be handed a
+        # connection); none kept open: slowest call 0.34 s.
+        limits=httpx.Limits(
+            max_connections=_conns,
+            max_keepalive_connections=int(os.environ.get("JEV_KEEPALIVE", str(_conns)))),
+        headers={"Authorization": f"Bearer {JEV_KEY}"})
     max_hops = int(os.environ.get("JEV_EXPAND_MAX_HOPS", "5"))
     # JEV_FLAT=1 (speed mode, stage A): the first round judges hop 1 and
     # hop 2 together. Hop 2 is reached without the judge choosing names:
@@ -2085,7 +2241,11 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                 print(f"🌱 chain start `{n['symbol']}`: {len(picks)} names "
                       f"scored, first {chains} start a chain —"
                       + _fmt_picks(picks))
-        elif os.environ.get("JEV_SEED_NAMES", "0") == "1" and not use_llm_judge:
+        elif os.environ.get("JEV_SEED_NAMES", "0") in ("1", "2") and not use_llm_judge:
+            # 1 = the judge's picks replace the blind opening (see below).
+            # 2 = both: the picks are followed AND the seed still opens the
+            #     definition of every name it uses.
+            _seed_both = os.environ.get("JEV_SEED_NAMES", "0") == "2"
             # Wide mode: the judge picks which names of a seed body to
             # follow, as it already does for every chain body. Without
             # this a seed opens the definition of every name it uses that
@@ -2120,6 +2280,8 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                     per_seed[n["root_i"]]["cost"] += _c
                 if picks:
                     n["follow"] = _picked(picks)
+                    if _seed_both:
+                        n["blind_too"] = True
                 decisions.append({
                     "kind": "start", "step": 0,
                     "from": f"`{n['symbol']}` in {n['file']}",
@@ -2261,7 +2423,9 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                     elif triage_defs and (c.get("why") or "").startswith("it defines `"):
                         # every definition this body uses, judged in one call
                         groups.setdefault((id(c["parent"]), "(definitions)"), []).append(c)
-                work = [(k, g) for k, g in groups.items() if len(g) >= triage_from]
+                _from = (triage_from if hops + 1 >= triage_hop
+                         else max(triage_from, max_hits + 1))
+                work = [(k, g) for k, g in groups.items() if len(g) >= _from]
                 dropped: set = set()
 
                 def _triage(item):
@@ -2350,8 +2514,8 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
             if len(cands) > budget and not flat_now:
                 print(f"⚠️  hop {hops + 1}: {len(cands)} candidates, budget {budget}: "
                       f"{len(cands) - budget} not judged")
-            if not flat_now:
-                cands = cands[:budget]
+            if not flat_now and len(cands) > budget:
+                cands = cands[:int(budget)]
             if not cands:
                 break
             hops += 2 if flat_now else 1
@@ -2388,11 +2552,77 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                         judge_target, question, c["chain"], c["why"],
                         c["file"], c["symbol"], c["excerpt"])
                 else:
+                    _t_p = time.time()
                     state, pool = _prep(c)
                     more: dict = {}
+                    # JEV_LOCAL_VERDICT=2: a body reached through a mention
+                    # and longer than the lines around that mention. One
+                    # more question in the SAME call: are those lines alone
+                    # evidence? No extra call.
+                    _win = ""
+                    if (os.environ.get("JEV_LOCAL_VERDICT", "0") == "2"
+                            and c.get("hit") is not None):
+                        _bl = c["body"].splitlines()
+                        _lw = int(os.environ.get("JEV_LOCAL_WINDOW", str(window)))
+                        _win = "\n".join(
+                            _bl[max(0, c["hit"] - _lw): c["hit"] + _lw + 1])
+                        if len(_win) < len(c["excerpt"]):
+                            more["around"] = _win
+                        else:
+                            _win = ""
+                    c["_t0"] = time.time()
+                    c["_prep"] = c["_t0"] - _t_p
+                    c["_chars"] = sum(len(str(v)) for v in state.values())
+                    # JEV_LOCAL_VERDICT=3: a body reached through a mention
+                    # is thought of as parts. In the SAME call Jev says, part
+                    # by part, whether it is needed. No extra call.
+                    _plines = []
+                    if (os.environ.get("JEV_LOCAL_VERDICT", "0") == "3"
+                            and c.get("hit") is not None):
+                        _plines = c["excerpt"].splitlines()
+                        more["parts"] = _code_parts(len(_plines))
                     raw_v, _p, c["cost"], picks, derived = _jev_verdict_names(
                         client, state, instructions, pool, more)
+                    c["_secs"] = time.time() - c["_t0"]
                     c["sign"] = more.get("signpost")
+                    if more.get("part_answers") and raw_v in ("accept", "continue"):
+                        # The writer gets the parts Jev called needed (more
+                        # likely yes than no), in order, with a marker where
+                        # lines were left out. All parts needed, or none: the
+                        # whole body stays.
+                        _pa = more["part_answers"]
+                        _keep = [i for i, v in enumerate(_pa) if v >= 0.5]
+                        c["parts_log"] = (
+                            f"{','.join(str(i + 1) for i in _keep) or '-'}"
+                            f"/{len(_pa)}")
+                        if 0 < len(_keep) < len(_pa):
+                            _out, _gap = [], None
+                            for i, (a, b) in enumerate(more["parts"]):
+                                if i in _keep:
+                                    if _gap:
+                                        _out.append(f"… [lines {_gap[0]} to "
+                                                    f"{_gap[1]} of this body "
+                                                    "are not shown] …")
+                                        _gap = None
+                                    _out.extend(_plines[a - 1:b])
+                                else:
+                                    _gap = (_gap[0] if _gap else a, b)
+                            if _gap:
+                                _out.append(f"… [lines {_gap[0]} to {_gap[1]} "
+                                            "of this body are not shown] …")
+                            c["excerpt"] = "\n".join(_out)
+                            c["parts_used"] = True
+                    if _win and raw_v in ("accept", "continue"):
+                        # Jev kept the body, and says the lines around the
+                        # mention are evidence on their own (more likely yes
+                        # than no): the writer gets those lines, not the
+                        # whole body. Otherwise the whole body stays.
+                        c["local"] = float(more.get("local") or 0.0)
+                        c["rest"] = float(more.get("rest", 1.0))
+                        if c["local"] > 0.5 and c["rest"] < 0.5:
+                            c["around"] = _win
+                            c["excerpt"], c["cut"] = _win, True
+                            c["local_used"] = True
                     if (os.environ.get("JEV_LOCAL_VERDICT", "0") == "1"
                             and c.get("hit") is not None and raw_v == "reject"):
                         # The whole body was rejected. The same question with
@@ -2532,9 +2762,13 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                                + (f" signpost={sign:.2f}"
                                   if sign is not None else "")
                                + (f" local={loc:.2f}"
+                                  + (f" rest={c['rest']:.2f}"
+                                     if c.get("rest") is not None else "")
                                   + (" (verdict from the lines around the link)"
                                      if local_yes else "")
                                   if loc is not None else "")
+                               + (f" parts={c['parts_log']}"
+                                  if c.get("parts_log") else "")
                                + retry
                                + _fmt_picks(picks))
 
@@ -2547,6 +2781,22 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                 else:
                     list(ex.map(_judge, cands))
             _t_e = time.time()
+            # JEV_CALL_TIMES=1: how long the calls of this round took, one by
+            # one. It only prints; nothing else changes. Default 0 = as before.
+            if os.environ.get("JEV_CALL_TIMES", "0") == "1":
+                _tm = sorted((c for c in cands if c.get("_secs") is not None),
+                             key=lambda c: c["_secs"])
+                if _tm:
+                    _st = [c["_t0"] for c in _tm]
+                    print(f"⏱  calls of hop {hops}: {len(_tm)} timed · "
+                          f"fastest {_tm[0]['_secs']:.2f}s · "
+                          f"middle {_tm[len(_tm) // 2]['_secs']:.2f}s · "
+                          f"slowest {_tm[-1]['_secs']:.2f}s · "
+                          f"last one started {max(_st) - min(_st):.2f}s after the first · "
+                          f"local work before the calls, summed {sum(c['_prep'] for c in _tm):.2f}s")
+                    for c in _tm[-8:][::-1]:
+                        print(f"   ⏱  {c['_secs']:.2f}s · {c['_chars']:,} chars sent · "
+                              f"{c.get('verdict')} · {c['file']} `{c['symbol']}`")
             print(f"⏱  hop {hops}: search {_t_s - _t_h:.2f}s · triage {_tri:.2f}s · "
                   f"verdicts {_t_e - _t_v:.2f}s ({len(cands)} calls) · "
                   f"rest {(_t_e - _t_h) - (_t_s - _t_h) - _tri - (_t_e - _t_v):.2f}s")
@@ -2691,21 +2941,46 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
         # Q2, 2026-11-01: prepare_for_strict_sandbox() was read by Jev,
         # "continue" twice, and reached the writer as a one-line lead only.
         added_ids = {id(x) for x in added}
-        still_held = []
-        for c in held:
+
+        def _acc(c: dict) -> float:
+            pr = c.get("final_probs") or c.get("probs") or {}
+            return float(pr.get("accept") or 0)
+
+        def _is_helper(c: dict) -> bool:
             raw = c.get("final_raw") or c.get("verdict_raw")
             p = c.get("parent") or {}
-            parent_is_evidence = "verdict" not in p or id(p) in added_ids
-            if (raw == "continue" and parent_is_evidence
-                    and len(added) < max_add and used <= max_chars):
-                used += len(c["excerpt"])
-                added.append(c)
-                added_ids.add(id(c))
-                print(f"🌱 helper of evidence: {c['file']} `{c['symbol']}` "
-                      f"({c['why']}) attached")
-            else:
-                still_held.append(c)
-        held = still_held
+            return raw == "continue" and ("verdict" not in p
+                                          or id(p) in added_ids)
+
+        pending = (sorted(held, key=_acc, reverse=True) if helper_order
+                   else list(held))
+        while True:
+            moved, rest = False, []
+            for c in pending:
+                if (_is_helper(c) and _acc(c) >= helper_min
+                        and len(added) < max_add and used <= max_chars):
+                    used += len(c["excerpt"])
+                    added.append(c)
+                    added_ids.add(id(c))
+                    moved = True
+                    print(f"🌱 helper of evidence: {c['file']} `{c['symbol']}` "
+                          f"({c['why']}) attached — accept={_acc(c):.2f}")
+                else:
+                    rest.append(c)
+            pending = rest
+            # ordered by number, a helper can come before the helper that
+            # leads to it: go round again until nothing more is attached
+            if not (helper_order and moved):
+                break
+        low = sum(1 for c in pending if _is_helper(c) and _acc(c) < helper_min)
+        cut = sum(1 for c in pending if _is_helper(c) and _acc(c) >= helper_min)
+        if low:
+            print(f"🌱 helpers: {low} not attached, accept number below "
+                  f"{helper_min}")
+        if cut:
+            print(f"⚠️  helpers: {cut} not attached, a limit was reached "
+                  f"(JEV_EXPAND_MAX_ADD / JEV_EXPAND_MAX_CHARS)")
+        held = [c for c in held if id(c) not in added_ids]
     finally:
         client.close()
 
@@ -2755,8 +3030,19 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
         })
     # Followed but not attached: one-line leads, in the order they were reached.
     max_leads = int(os.environ.get("JEV_LEADS_MAX", "20"))
+    def _one_line(c: dict) -> str:
+        # A lead is one line. When the body it points to is itself a single
+        # line (a #define, a constant, a declaration), that line is the lead:
+        # the writer reads `#define X 256`, not only the name X. Whole-file
+        # bodies (<module>, <blob>) are left out.
+        b = (c.get("body") or "").strip()
+        if not b or "\n" in b or str(c.get("symbol") or "").startswith("<"):
+            return ""
+        return b
+
     leads = [{"file": c["file"], "symbol": c["symbol"],
-              "trail": " → ".join(c["trail"])} for c in held[:max_leads]]
+              "trail": " → ".join(c["trail"]),
+              "line": _one_line(c)} for c in held[:max_leads]]
     for c in added:
         if c.get("root_i") is not None:
             per_seed[c["root_i"]]["accepted"] += 1
@@ -3156,9 +3442,13 @@ async def _ask_internal_stream(req: AskRequest, max_tokens: int = 27000):
                 "DevLoops followed names from the code above and reached "
                 "these places, but was not sure they help, so their bodies "
                 "are not included. They are not evidence. Do not state "
-                "what they contain.\n"
+                "what they contain. Where a place is a single line of code, "
+                "that line is shown after \"text:\" and is its whole "
+                "content; you may use it.\n"
                 + "\n".join(f"- {l['file']} `{l['symbol']}` — chain: "
-                            f"{l['trail']}" for l in _start_leads))
+                            f"{l['trail']}"
+                            + (f" — text: `{l['line']}`" if l.get("line") else "")
+                            for l in _start_leads))
         sources_payload = [
             {
                 "skill_id":     s["skill_id"],
@@ -4597,8 +4887,7 @@ def _commit_slices_block(org_redis, item, commit: str, changed: str,
                     - len(changed))
             client = httpx.Client(
                 timeout=60,
-                headers={"Authorization":
-                         f"Bearer {os.environ.get('OPENROUTER_API_KEY', '')}"})
+                headers={"Authorization": f"Bearer {JEV_KEY}"})
 
             def _pick(chunk: list[dict]) -> float:
                 payload = {"model": JEV_MODEL, "state": {
@@ -5434,6 +5723,25 @@ async def _launch_report_job(report_id: str) -> int:
     task.add_done_callback(lambda _t, rid=report_id: _track_running(rid, False))
     task.add_done_callback(lambda _t, rid=report_id: _lease_release(rid))
     return len(items)
+
+
+@app.on_event("startup")
+async def _raise_open_files_limit():
+    """A round of judge calls opens one connection per call, up to
+    JEV_CONCURRENCY at once. macOS lets one program keep only 256 files and
+    connections open by default, so a round of more than about 220 calls ran
+    into that wall and its last calls came back about 2 s late (measured
+    2026-11-13: slowest call 2.54 s at 256, 1.41 s at 4096). Ask the system
+    for 4096; if it refuses, the limit stays as it was."""
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        want = 4096 if hard == resource.RLIM_INFINITY else min(4096, hard)
+        if soft < want:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (want, hard))
+            print(f"🔧 open files limit raised from {soft} to {want}")
+    except Exception as e:
+        print(f"⚠️  open files limit not raised ({type(e).__name__}: {e})")
 
 
 @app.on_event("startup")

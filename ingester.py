@@ -2021,6 +2021,9 @@ def find_references(content, symbols, file_path):
 class GitDiffIngester:
     def __init__(self, repo_path):
         self.repo = os.path.abspath(repo_path)
+        # --snapshot: this commit is ingested as if it had no parent, so
+        # every file in it counts as new. None = off.
+        self.snapshot = None
 
     def _run(self, args):
         start = time.time()
@@ -2065,6 +2068,13 @@ class GitDiffIngester:
         payload. Diffing parent..h matches file_at_raw(parent, …), so the
         file list and the body reads can never disagree about the baseline.
         --root fallback covers the parentless root commit."""
+        if h == self.snapshot:
+            # Snapshot: all files of the commit, nothing deleted.
+            if diff_filter == 'D':
+                return []
+            out = self.git('ls-tree', '-r', '--name-only', h)
+            return [f for f in (l.strip() for l in out.split('\n'))
+                    if f and is_ingestable(f)]
         parent = self.parent_hash(h)
         if parent:
             out = self.git('diff', '--no-renames', '--name-only',
@@ -2094,6 +2104,8 @@ class GitDiffIngester:
         return data.decode('utf-8', 'replace')
 
     def parent_hash(self, h):
+        if h == self.snapshot:
+            return None
         try:
             return self.git('rev-parse', f'{h}^')
         except Exception:
@@ -2104,8 +2116,13 @@ class GitDiffIngester:
 
     def commit_range(self, since=None, max_n=None):
         if since:
-            out = self.git('log', '--format=%H', '--topo-order', '--reverse',
-                           f'{since}..HEAD')
+            # --first-parent: walk the main line only. A merge is one step
+            # that brings in what its branch changed. Walking both sides as
+            # one line made the index jump between two versions of a file,
+            # and functions were marked deleted and never registered again
+            # (open62541: master and the 1.5 branch).
+            out = self.git('log', '--format=%H', '--topo-order', '--first-parent',
+                           '--reverse', f'{since}..HEAD')
             hashes = [h for h in out.split('\n') if h]
             if not hashes:
                 # Root-commit fallback: sinceRef..HEAD excludes sinceRef itself,
@@ -2114,13 +2131,13 @@ class GitDiffIngester:
                     root = self.git('rev-parse', since)
                     self.git('cat-file', '-e', root)
                     out = self.git('log', '--format=%H', '--topo-order',
-                                   '--reverse')
+                                   '--first-parent', '--reverse')
                     hashes = [h for h in out.split('\n') if h]
                 except Exception:
                     hashes = []
             return hashes[:max_n] if max_n else hashes
         count = f'-{max_n}' if max_n else ''
-        args = ['log', '--format=%H', '--topo-order'] + ([count] if count else [])
+        args = ['log', '--format=%H', '--topo-order', '--first-parent'] + ([count] if count else [])
         out = self.git(*args)
         return [h for h in out.split('\n') if h][::-1]
 

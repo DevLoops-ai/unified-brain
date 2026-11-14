@@ -212,6 +212,30 @@ class CodeEmbedder:
                 except Exception as e:
                     print(f"⚠️  local question vector failed "
                           f"({type(e).__name__}): using the hosted model")
+            # QUERY_EMBED_URL / QUERY_EMBED_API_KEY / QUERY_EMBED_MODEL (all
+            # three set = on; not set = as before): the question's vector is
+            # asked from another hosted service that speaks the same
+            # /embeddings call (Fireworks). Stored vectors and ingestion are
+            # not touched.
+            _url = os.environ.get("QUERY_EMBED_URL", "")
+            _key = os.environ.get("QUERY_EMBED_API_KEY", "")
+            _mdl = os.environ.get("QUERY_EMBED_MODEL", "")
+            if _url and _key and _mdl and self.name == "qwen":
+                try:
+                    import httpx
+                    r = httpx.post(
+                        _url, headers={"Authorization": f"Bearer {_key}"},
+                        json={"model": _mdl, "input": batch}, timeout=30)
+                    r.raise_for_status()
+                    vecs = [d["embedding"] for d in r.json()["data"]]
+                    if all(len(v) == self.dims for v in vecs):
+                        return vecs
+                    print(f"⚠️  question vector from QUERY_EMBED_URL has "
+                          f"{len(vecs[0])} numbers, the store needs "
+                          f"{self.dims}: using DeepInfra")
+                except Exception as e:
+                    print(f"⚠️  question vector from QUERY_EMBED_URL failed "
+                          f"({type(e).__name__}): using DeepInfra")
         resp = _embed_with_retry(self.client, batch, model=self.model)
         return [d.embedding for d in resp.data]
 

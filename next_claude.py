@@ -11,6 +11,7 @@ When the commits are done, one embedding pass fills the code-vector store
     python next_claude.py /path/to/repo                 # whole history
     python next_claude.py /path/to/repo --since <ref>   # commits after <ref>
     python next_claude.py /path/to/repo --resume        # continue after the last ingested commit
+    python next_claude.py /path/to/repo --snapshot      # only the code as it is now, no history (minutes)
     python next_claude.py /path/to/repo --max 200       # at most N commits
     python next_claude.py /path/to/repo --no-embed      # skip the embedding pass
     python next_claude.py /path/to/repo --embed-only    # only the embedding pass
@@ -269,10 +270,17 @@ async def ingest_payload(payload: dict, r, rb, reconciler: DefKeyReconciler,
 # ── The run ──────────────────────────────────────────────────────────────────
 
 async def ingest_repo(repo_path: str, *, since: str | None, max_n: int | None,
-                      r, rb) -> dict:
+                      r, rb, snapshot: bool = False) -> dict:
     ingester = GitDiffIngester(repo_path)
     reconciler = DefKeyReconciler(r, None, rb)
-    commits = ingester.commit_range(since, max_n)
+    if snapshot:
+        # One step: the code as it is at HEAD, every file as new. No walk
+        # through the history. --resume continues from here commit by commit.
+        head = ingester.head_hash()
+        ingester.snapshot = head
+        commits = [head]
+    else:
+        commits = ingester.commit_range(since, max_n)
     print(f"\n🏗️  ingest {repo_path}: {len(commits)} commit(s)"
           + (f" after {since[:12]}" if since else "") + "\n")
     totals = {"commits": len(commits), "done": 0, "skipped": 0, "failed": 0,
@@ -361,7 +369,14 @@ def main() -> None:
         if "--resume" in sys.argv and not since:
             since = r.get("resume_point") or None
         max_n = int(_arg("--max")) if _arg("--max") else None
-        totals = asyncio.run(ingest_repo(repo_path, since=since, max_n=max_n, r=r, rb=rb))
+        snapshot = "--snapshot" in sys.argv
+        if snapshot and r.get("resume_point"):
+            print("⚠️  --snapshot needs an empty database, and this one already "
+                  "holds commits. Delete the .unified-brain.db file first, or "
+                  "use --resume to continue.")
+            sys.exit(1)
+        totals = asyncio.run(ingest_repo(repo_path, since=since, max_n=max_n, r=r, rb=rb,
+                                         snapshot=snapshot))
         print(f"\n✅ {totals['done']} commit(s) ingested, {totals['skipped']} with no symbol change, "
               f"{totals['failed']} failed; skills created={totals['created']} "
               f"updated={totals['updated']} obsoleted={totals['obsoleted']} "

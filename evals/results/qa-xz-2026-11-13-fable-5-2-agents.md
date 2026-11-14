@@ -26,7 +26,7 @@ points. Answers: `evals/runs/fable-5-2-medium-xz-2026-11-13/` and
 - **On the author's subscription: after this day's session the account
   showed 86 % of the monthly allowance used.** That figure is for the
   whole session (the two agent runs, plus a long working conversation
-  that graded about forty unified-brain answers the same day); the share
+  that graded several dozen unified-brain answers the same day); the share
   of the two runs alone was not shown. It is consistent with the
   estimate: the two runs are the large items.
 - The dollar figures are estimates, not a bill. The harness reported one
@@ -178,12 +178,15 @@ Full marks — medium: Q1, Q2, Q4, Q7. Max: Q1, Q2, Q4, Q5, Q7.
 
 ## What stands out
 
-- **Q4 is 7 / 7 in both runs, the first full scores on it by any system.**
+- **Q4 is 7 / 7 in both runs, the first full scores on it by an agent.**
   Both found the SPDX exemption in `build-aux/license-check.sh`
   (`PAT_UNTAGGED_0BSD`: `^tests/files/[^/]+\.(lz|lzma|xz)$` and
-  `xzgrep_expected_output`), which Opus 5.5, Fable 5.1 and every
-  unified-brain profile missed, and both read the body of
-  `tuktest_file_from_x()` (64 MiB limit, short read).
+  `xzgrep_expected_output`), which the Opus 5.5 and Fable 5.1 agents
+  missed, and both read the body of `tuktest_file_from_x()` (64 MiB
+  limit, short read). unified-brain has scored 7 / 7 on Q4 before, with
+  the exemption (`qa-xz-2026-11-01.md` and the re-run in
+  `qa-xz-2026-11-01-b.md`), but not in run f (5.5) and not in any fast
+  profile (4.0 to 5.25).
 - **Q7 is 6 / 6 on the original question in both runs.** The agents open
   `io_open_src_real()` on their own; the fast profile needs the added
   clause for that (4.5 without, 5.75 with).
