@@ -1284,6 +1284,48 @@ def match_occurrences(before_syms, after_syms):
     return pairs, added, deleted
 
 
+def _attach_leading_comments(symbols, lines, tree):
+    """A comment written directly above a symbol belongs to that symbol.
+
+    The comment block that ends on the line before the symbol, with no
+    blank line between, is moved into the symbol: its text goes in front
+    of the symbol's code and the symbol's line moves up to the comment's
+    first line. Without this the comment lands in <module>, away from the
+    code it describes (open62541 server.h: a <module> of 94,622 characters,
+    98% of it such comments).
+
+    Which lines are comments is read from the parse tree (node types that
+    contain "comment"), so no per-language comment syntax is written here.
+    A line counts only when a comment is the first thing on it. A comment
+    separated from the symbol by a blank line stays where it was."""
+    if tree is None:
+        return
+    comment_lines = set()
+    stack = [tree.root_node]
+    while stack:
+        node = stack.pop()
+        if 'comment' in node.type:
+            a, b = node.start_point[0], node.end_point[0]
+            first = lines[a] if a < len(lines) else ''
+            if not first[:node.start_point[1]].strip():
+                comment_lines.update(range(a + 1, b + 2))
+            continue
+        stack.extend(node.children)
+    if not comment_lines:
+        return
+    taken = set()
+    for s in sorted((s for s in symbols if '_end' in s and s.get('line')),
+                    key=lambda s: (s['line'], -s['_end'])):
+        top = s['line']
+        while (top - 1) in comment_lines and (top - 1) not in taken:
+            top -= 1
+        if top == s['line']:
+            continue
+        taken.update(range(top, s['line']))
+        s['code'] = '\n'.join(lines[top - 1:s['line'] - 1]) + '\n' + s['code']
+        s['line'] = top
+
+
 def _module_symbol(symbols, lines, lang='text'):
     """Synthetic <module> symbol: code = all lines NOT covered by any
     top-level symbol span (imports, top-level statements, decorators).
@@ -1850,6 +1892,7 @@ def extract_symbols(content, file_path):
         else:
             symbols = _TIER2_EXTRACTORS[lang](src, lang, lines, tree)
 
+        _attach_leading_comments(symbols, lines, tree)
         mod = _module_symbol(symbols, lines, lang)
         if mod is not None:
             symbols.append(mod)

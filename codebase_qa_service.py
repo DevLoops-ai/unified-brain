@@ -1448,6 +1448,62 @@ _DERIVED_INSTRUCTIONS = (
 # Options one Jev choice question can take.
 _JEV_MAX_CHOICES = 255
 
+# ── How much text one Jev call may carry ────────────────────────────────────
+# FACT (TypeSafe's published limits for Jev, read 2026-11-16): by default a
+# request may hold 64,000 tokens, of which 32,000 are for the state plus the
+# longest question. (A header, TypeSafe-Danger-Zone-Long-Context: true,
+# raises both to 262,000; TypeSafe says such calls are slower and less
+# accurate. This code does not send that header.)
+#
+# JEV_STATE_MAX_TOKENS in .env is that limit (32000). When it is set, a body
+# is cut for Jev only when the call would go over it.
+#
+# The code counts characters and Jev counts tokens. The link between the two
+# is NOT guessed: every answer from Jev reports how many tokens the call had
+# (usage.input_tokens). From these the code keeps, for as long as the
+# service runs:
+#   - the fewest characters per token Jev has reported (the dense case), and
+#   - the longest "questions" part sent so far, in characters.
+# Room for the state = limit x characters-per-token - that questions part.
+# Both numbers are on the careful side, so the result is never too big.
+#
+# Until Jev has answered once (the first calls after the service starts),
+# and whenever JEV_STATE_MAX_TOKENS is not set or Jev reports no token
+# count, the old fixed number is used: JEV_BODY_MAX_CHARS (60,000
+# characters). That number was a guess at the limit above and sits well
+# under it.
+_JEV_SEEN = {"chars_per_token": None, "questions_chars": 0}
+
+
+def _jev_note_usage(payload: dict, usage) -> None:
+    """Remember what one answered Jev call tells about tokens."""
+    try:
+        toks = int((usage or {}).get("input_tokens")
+                   or (usage or {}).get("prompt_tokens") or 0)
+        if toks <= 0:
+            return
+        chars = len(json.dumps(payload, ensure_ascii=False))
+        cpt = chars / toks
+        if (_JEV_SEEN["chars_per_token"] is None
+                or cpt < _JEV_SEEN["chars_per_token"]):
+            _JEV_SEEN["chars_per_token"] = cpt
+        q = len(json.dumps(payload.get("questions") or {}, ensure_ascii=False))
+        if q > _JEV_SEEN["questions_chars"]:
+            _JEV_SEEN["questions_chars"] = q
+    except Exception:
+        pass
+
+
+def _jev_body_cap() -> int:
+    """Characters of state one Jev call may carry. See the note above."""
+    old = int(os.environ.get("JEV_BODY_MAX_CHARS", "60000"))
+    limit = int(os.environ.get("JEV_STATE_MAX_TOKENS", "0") or 0)
+    cpt = _JEV_SEEN["chars_per_token"]
+    if limit <= 0 or cpt is None:
+        return old
+    room = int(limit * cpt) - _JEV_SEEN["questions_chars"]
+    return room if room > 0 else old
+
 
 # Jev takes 128 questions in one call. The call also carries the verdict
 # and a few other questions, so this many are left for part questions.
@@ -1557,6 +1613,17 @@ def _jev_verdict_names_one(client, state: dict, instructions: str,
                              "`code_around_link`, also needed to answer the "
                              "`question`?"),
         }
+    # JEV_HELPER_KEEP=1: asked next to the verdict, used only when the body
+    # turns out to be a helper (judged "continue", parent is evidence).
+    ask_keep = extra is not None and bool(extra.get("ask_keep"))
+    if ask_keep:
+        questions["keep"] = {
+            "type": "noul",
+            "instructions": ("Suppose this `code` is not itself evidence for "
+                             "the `question`. Does the person who writes the "
+                             "answer still need to read this `code` to "
+                             "answer the `question` fully?"),
+        }
     # JEV_LOCAL_VERDICT=3: one yes/no question per part of `code`. The
     # code is sent once, with a "### part N" line above each part, so that
     # Jev sees which lines a part holds.
@@ -1567,15 +1634,19 @@ def _jev_verdict_names_one(client, state: dict, instructions: str,
         state = {**state, "code": "\n".join(
             f"### part {i + 1}\n" + "\n".join(_cl[a - 1:b])
             for i, (a, b) in enumerate(_pl))}
-        for i in range(len(_pl)):
-            questions[f"part{i}"] = {
-                "type": "noul",
-                "instructions": (
-                    "The \"### part N\" lines in `code` are not part of "
-                    "the code; they only number its parts. Look at the "
-                    f"lines under \"### part {i + 1}\". Are these lines "
-                    "needed to answer the `question`?"),
-            }
+        # One choice over the parts, read by _picked() like the names.
+        questions["parts"] = {
+            "type": "choice",
+            "instructions": ("The \"### part N\" lines in `code` are not "
+                             "part of the code; they only number its parts. "
+                             "Which part of `code` is needed to answer the "
+                             "`question`? Pick \"(none of these)\" if no "
+                             "part is."),
+            "criteria": {**{f"part {i + 1}":
+                            f'the lines under "### part {i + 1}" are needed'
+                            for i in range(len(_pl))},
+                         _NONE_NAME: "no part of `code` is needed"},
+        }
     as_choice = _names_as_choice() and bool(names)
     if as_choice:
         # One question: which name from `code` should be searched next?
@@ -1617,6 +1688,8 @@ def _jev_verdict_names_one(client, state: dict, instructions: str,
             data = res.json()
         except ValueError:
             return None, {}, 0.0, {}, 0.0
+        if res.status_code == 200:
+            _jev_note_usage(payload, data.get("usage"))
         answers = data.get("answers") or {}
         ans = answers.get("v") or {}
         if res.status_code == 200 and ans.get("choice") in _JEV_VERDICTS:
@@ -1639,12 +1712,13 @@ def _jev_verdict_names_one(client, state: dict, instructions: str,
                 # no answer = the rest is needed (the whole body stays)
                 rs = (answers.get("rest") or {}).get("noul")
                 extra["rest"] = float(rs) if rs is not None else 1.0
+            if ask_keep:
+                kp = (answers.get("keep") or {}).get("noul")
+                extra["keep"] = float(kp) if kp is not None else None
             if ask_parts:
-                # no answer for a part = it is needed (it stays)
-                extra["part_answers"] = [
-                    (lambda v: float(v) if v is not None else 1.0)(
-                        (answers.get(f"part{i}") or {}).get("noul"))
-                    for i in range(len(extra["parts"]))]
+                # no answer = no picks (the whole body stays)
+                pp = (answers.get("parts") or {}).get("probabilities") or {}
+                extra["part_picks"] = {n: float(v) for n, v in pp.items()}
             d = (answers.get("derived") or {}).get("noul")
             return (ans["choice"], ans.get("probabilities") or {},
                     float((data.get("usage") or {}).get("cost") or 0), picks,
@@ -1790,6 +1864,10 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
     # names Jev now picks.
     names_all = os.environ.get("JEV_NAMES_ALL", "0") == "1"
     helper_min   = float(os.environ.get("JEV_HELPER_MIN_ACCEPT", "0"))
+    # JEV_HELPER_KEEP=1: a helper is attached only when Jev itself says the
+    # writer needs it (one more yes/no question in the body's own call, no
+    # extra call). JEV_HELPER_MIN_ACCEPT is then not used. 0 = as before.
+    helper_keep  = os.environ.get("JEV_HELPER_KEEP", "0") == "1"
     max_hits  = int(os.environ.get("JEV_EXPAND_MAX_HITS", "25"))    # more hits = name is everywhere
     # With the hit triage on, a common name is not dropped: every place is
     # fetched and the triage picks the ones to open. max_hits then only
@@ -1812,7 +1890,11 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
     # definition whether to open it, and reads follow highest probability first.
     triage_defs = triage_on and os.environ.get("JEV_TRIAGE_DEFS", "0") == "1"
     window    = int(os.environ.get("JEV_EXPAND_WINDOW", "10"))      # lines around a link
-    body_cap  = int(os.environ.get("JEV_BODY_MAX_CHARS", "60000"))
+    body_cap  = _jev_body_cap()      # see "How much text one Jev call may carry"
+    print(f"📏 room for one Jev call: {body_cap:,} characters"
+          + (f" ({_JEV_SEEN['chars_per_token']:.2f} characters per token, "
+             f"measured from Jev)" if _JEV_SEEN["chars_per_token"] else
+             " (JEV_BODY_MAX_CHARS; nothing measured yet)"))
     t0 = time.time()
     greps = 0
     _ranks: dict = {}      # commit → rank, shared by this chain's greps
@@ -2573,6 +2655,8 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                     c["_t0"] = time.time()
                     c["_prep"] = c["_t0"] - _t_p
                     c["_chars"] = sum(len(str(v)) for v in state.values())
+                    if helper_keep:
+                        more["ask_keep"] = True
                     # JEV_LOCAL_VERDICT=3: a body reached through a mention
                     # is thought of as parts. In the SAME call Jev says, part
                     # by part, whether it is needed. No extra call.
@@ -2585,16 +2669,21 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                         client, state, instructions, pool, more)
                     c["_secs"] = time.time() - c["_t0"]
                     c["sign"] = more.get("signpost")
-                    if more.get("part_answers") and raw_v in ("accept", "continue"):
+                    c["keep"] = more.get("keep")
+                    if more.get("part_picks") and raw_v in ("accept", "continue"):
                         # The writer gets the parts Jev called needed (more
                         # likely yes than no), in order, with a marker where
                         # lines were left out. All parts needed, or none: the
                         # whole body stays.
-                        _pa = more["part_answers"]
-                        _keep = [i for i, v in enumerate(_pa) if v >= 0.5]
+                        _pa = more["parts"]
+                        _keep = sorted(
+                            int(n.split()[1]) - 1
+                            for n in _picked(more["part_picks"])
+                            if n.startswith("part "))
                         c["parts_log"] = (
                             f"{','.join(str(i + 1) for i in _keep) or '-'}"
-                            f"/{len(_pa)}")
+                            f"/{len(_pa)}(none="
+                            f"{more['part_picks'].get(_NONE_NAME, 0):.2f})")
                         if 0 < len(_keep) < len(_pa):
                             _out, _gap = [], None
                             for i, (a, b) in enumerate(more["parts"]):
@@ -2767,6 +2856,8 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                                   + (" (verdict from the lines around the link)"
                                      if local_yes else "")
                                   if loc is not None else "")
+                               + (f" keep={c['keep']:.2f}"
+                                  if c.get("keep") is not None else "")
                                + (f" parts={c['parts_log']}"
                                   if c.get("parts_log") else "")
                                + retry
@@ -2952,19 +3043,28 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
             return raw == "continue" and ("verdict" not in p
                                           or id(p) in added_ids)
 
+        def _wanted(c: dict) -> bool:
+            # JEV_HELPER_KEEP=1: Jev said the writer needs it (more likely
+            # yes than no). No answer from Jev = not attached.
+            if helper_keep:
+                return c.get("keep") is not None and c["keep"] > 0.5
+            return _acc(c) >= helper_min
+
         pending = (sorted(held, key=_acc, reverse=True) if helper_order
                    else list(held))
         while True:
             moved, rest = False, []
             for c in pending:
-                if (_is_helper(c) and _acc(c) >= helper_min
+                if (_is_helper(c) and _wanted(c)
                         and len(added) < max_add and used <= max_chars):
                     used += len(c["excerpt"])
                     added.append(c)
                     added_ids.add(id(c))
                     moved = True
                     print(f"🌱 helper of evidence: {c['file']} `{c['symbol']}` "
-                          f"({c['why']}) attached — accept={_acc(c):.2f}")
+                          f"({c['why']}) attached — accept={_acc(c):.2f}"
+                          + (f" keep={c['keep']:.2f}"
+                             if c.get("keep") is not None else ""))
                 else:
                     rest.append(c)
             pending = rest
@@ -2972,9 +3072,11 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
             # leads to it: go round again until nothing more is attached
             if not (helper_order and moved):
                 break
-        low = sum(1 for c in pending if _is_helper(c) and _acc(c) < helper_min)
-        cut = sum(1 for c in pending if _is_helper(c) and _acc(c) >= helper_min)
-        if low:
+        low = sum(1 for c in pending if _is_helper(c) and not _wanted(c))
+        cut = sum(1 for c in pending if _is_helper(c) and _wanted(c))
+        if low and helper_keep:
+            print(f"🌱 helpers: {low} not attached, Jev did not say keep")
+        elif low:
             print(f"🌱 helpers: {low} not attached, accept number below "
                   f"{helper_min}")
         if cut:
