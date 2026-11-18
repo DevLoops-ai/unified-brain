@@ -2,30 +2,17 @@
 
 **Persistent memory for System One coding agents, by [DevLoops](https://devloops.ai).**
 
-On 24/10/2026 I have published as OSS a framework I call unified-brain: evidence gathering that is fast and cheap, and close to a frontier coding agent in accuracy. On the same nine-question, 74-point xz benchmark (`evals/questions/xz.md`) it has four measured profiles (`env.example`). The strongest agent I have measured is Claude Fable 5.2 at max reasoning effort: 72.75 / 74, in 5,372 s, for about $50 (`evals/results/qa-xz-2026-11-13-fable-5-2-agents.md`). Against it:
+On 24/10/2026 I have published as open source software a framework I call unified-brain: fast, cheap but also close -if not better- to frontier inner agent loops, evidence gathering for AI assisted SWE. The magic sauce is an intermediary SQLITE memory layer that facilitates retrieval, filtering and judging through System One decision models for the efficient evidence gathering — pplx-decider, an open-weights 27B (Apache-2.0) or pplx-decider-flash or Jev, a proprietary one.
 
-| Profile | Score | Share of Fable 5.2 max's points | Cost, nine questions | Cheaper by | Time, nine questions | Faster by |
-|---|---|---|---|---|---|---|
-| **Full** | 70 / 74 | 96 % | $0.660 for six questions ¹ | about 50× ¹ | 435 s for six questions ¹ | 8.6× ¹ |
-| **Cheap** | 68.75 / 74 | 94.5 % | $0.253 | about 196× | 519 s | 10.4× |
-| **Hybrid-reliable** | 66.5 / 74 | 91.4 % | $0.135 | about 367× | 396 s | 13.6× |
-| **Ultra-fast local** | 62.0 / 74 | 85.2 % | $0.161 | about 308× | 90.7 s | 59× |
-| Claude Fable 5.2, max effort | 72.75 / 74 | — | about $50 (estimated) | — | 5,372 s | — |
+Evidence gathering is the most expensive part of -in terms of time and computational resources- getting an answer from an AI agent. So logically, a product optimizing this can be useful.
 
-¹ The Full run has complete footers for six of the nine questions (Q1, Q2, Q3, Q7, Q8, Q9). Its cost and time are compared with Fable 5.2 on those same six: about $33.21 and 3,752 s.
+The idea behind this architecture is to address cost and environmental burdens in AI assisted SWE through architectural elegance, rather than relying primarily on brute force model scaling.
 
-How to read the table:
+Unified-brain is an open source architecture that inspires to be what unreliable RAGs and not easy to scale Graph-RAGs never managed to be: a simplified way to reach cheap, fast and compute-efficient evidence gathering engines.
 
-- Fable 5.2's cost is an estimate from the tokens the harness reported, at list prices with prompt caching on ($42 to $57 for the nine; the table uses the middle). It is not a bill, and thinking tokens are not counted, so it is more likely too low than too high. Our costs are measured from the answer footers.
-- Full and Cheap were measured on xz at `45d08abc` with the writer on Fireworks; Hybrid-reliable, Ultra-fast local and Fable 5.2 on xz at `7baf6835`, ours with the writer on Isoquant, which is cheaper.
-- Ultra-fast local is the Jev-judge run of 2026-11-13; its eval file is not in `evals/results/` yet. The same profile with the pplx judges is (`qa-xz-2026-11-13-ultrafast-local-k40-pplx.md`: 62.25 / 74, $0.065, 12.1 s per answer).
-- One run per question for every row, and one grader (Claude Fable) for all of them.
+Unified-brain has the capability to be always up-to-date and to never depend from session memory, since all the info lives in a local SQLite updatable memory. It replaces the need for turn based LLM agents with a cheap retrieval and System One discovery algorithm that does not require energy intensive computations.
 
-Full also equals a Claude Opus 5.5 agent (70 / 74) and is above a Claude Fable 5.1 agent (69 / 74), both at high effort (`qa-xz-2026-10-29.md`). It started at 86.5% on 29/10; every retrieval change on the way is written up in `evals/results/`. The evaluator is done by a decision judge model (Jev, or the open-weights pplx-decider), not by the writer model that can be anything you want.
-
-The writer is a totally separate phase that works in one go.
-
-The magic sauce is an intermediary OS (SQLITE) memory layer that facilitates retrieval, filtering and judging through a System One decision model — depending the profile, pplx-decider, an open-weights 27B (Apache-2.0), pplx-flash or Jev, a proprietary one, in the coverage profile.
+The writer is a totally separate phase that works in one go with ANY LLM the user wants.
 
 The agent spawned from unified-brain runs through MCP on Cursor, OpenCode or Claude Code etc. allowing you to use it through your favorite harness.
 
@@ -39,7 +26,7 @@ This is because the limits holding back AI are:
 
 The LLM turn reasoning it is introducing uncertainty and probabilistic outcomes.
 
-BUT.. Unified-brain's System One discovery engine breaks the task into hundreds of yes-or-no calls, so the search itself does not reason in prose and cannot hallucinate a path. Across five graded xz runs the answers contained one wrong claim per run at most, always the same one on the longest answer — a constant misquoted by the writer with the right value in its evidence; never a retrieval error. Replicability across runs has not been conclusively measured yet.
+BUT.. Unified-brain's System One discovery engine breaks the task into hundreds of yes-or-no calls, so the search itself does not reason in prose and cannot "hallucinate" -at least in the sense of prose drifting- a path.
 
 - **Context Loss and Memory Limits**:
 
@@ -72,6 +59,27 @@ Perhaps the most exciting development however from this proposed shift (establis
 - **Potentially fewer corrective attempts.** If structured discovery improves evidence completeness and accuracy, it can reduce costly follow-up investigation and answer regeneration.
 
 None of the energy savings has been measured. The measured quantities are tokens, dollars and seconds, in `evals/`.
+
+On the same nine-question, 74-point xz benchmark (`evals/questions/xz.md`) it has four measured profiles (`env.example`). The strongest agent I have measured is Claude Fable 5.2 at max reasoning effort: 72.75 / 74, in 5,372 s, for about $50 (`evals/results/qa-xz-2026-11-13-fable-5-2-agents.md`). Against it:
+
+| Profile | Score | Share of Fable 5.2 max's points | Cost, nine questions | Cheaper by | Time, nine questions | Faster by |
+|---|---|---|---|---|---|---|
+| **Full** | 70 / 74 | 96 % | $0.660 for six questions ¹ | about 50× ¹ | 435 s for six questions ¹ | 8.6× ¹ |
+| **Cheap** | 68.75 / 74 | 94.5 % | $0.253 | about 196× | 519 s | 10.4× |
+| **Hybrid-reliable** | 66.5 / 74 | 91.4 % | $0.135 | about 367× | 396 s | 13.6× |
+| **Ultra-fast local** | 62.0 / 74 | 85.2 % | $0.161 | about 308× | 90.7 s | 59× |
+| Claude Fable 5.2, max effort | 72.75 / 74 | — | about $50 (estimated) | — | 5,372 s | — |
+
+¹ The Full run has complete footers for six of the nine questions (Q1, Q2, Q3, Q7, Q8, Q9). Its cost and time are compared with Fable 5.2 on those same six: about $33.21 and 3,752 s.
+
+How to read the table:
+
+- Fable 5.2's cost is an estimate from the tokens the harness reported, at list prices with prompt caching on ($42 to $57 for the nine; the table uses the middle). It is not a bill, and thinking tokens are not counted, so it is more likely too low than too high. Our costs are measured from the answer footers.
+- Full and Cheap were measured on xz at `45d08abc` with the writer on Fireworks; Hybrid-reliable, Ultra-fast local and Fable 5.2 on xz at `7baf6835`, ours with the writer on Isoquant, which is cheaper.
+- Ultra-fast local is the Jev-judge run of 2026-11-13; its eval file is not in `evals/results/` yet. The same profile with the pplx judges is (`qa-xz-2026-11-13-ultrafast-local-k40-pplx.md`: 62.25 / 74, $0.065, 12.1 s per answer).
+- One run per question for every row, and one grader (Claude Fable) for all of them.
+
+Full also equals a Claude Opus 5.5 agent (70 / 74) and is above a Claude Fable 5.1 agent (69 / 74), both at high effort (`qa-xz-2026-10-29.md`). It started at 86.5% on 29/10; every retrieval change on the way is written up in `evals/results/`. The evaluator is done by a decision judge model (Jev, or the open-weights pplx-decider), not by the writer model that can be anything you want.
 
 ---
 
@@ -183,11 +191,29 @@ python ingester.py ~/code/xz scan-coverage
 
 ### 3. Ingest a repository
 
-The ingester reads the git history and writes one file,
+The ingester reads the repository and writes one file,
 `<repo>/.unified-brain.db`. No LLM is used; it is CPU work plus git. When the
-commits are in, the embedding pass runs once over the stored bodies.
+code is in, the embedding pass runs once over the stored bodies.
 
-A first try — a slice of the history, so you see results in minutes:
+The fast way — only the code as it is now, no history:
+
+```bash
+python next_claude.py ~/code/xz --snapshot
+```
+
+This ingests the current commit in one step (open62541: 143 seconds on an M3 - 4 minutes 30 seconds the whole process for approx 13,000 commits),
+then runs the embedding pass. It is enough to ask questions about the code as
+it is today. The timeline starts at this commit; earlier commits are not in
+the database.
+
+`--snapshot` needs an empty database. Later commits are added one by one:
+
+```bash
+git pull
+python next_claude.py ~/code/xz --resume
+```
+
+With history — a slice, so you see results in minutes:
 
 ```bash
 # 1,349 commits of xz, from January 2021 (the threaded decoder work) to July 2024
@@ -201,7 +227,8 @@ Progress prints one line per commit and a summary at the end
 (`✅ 1349 commit(s) ingested … skills created=… updated=… obsoleted=…`),
 then the embedding pass (`🧬 embedding pass [voyage] … 1943/1943`).
 
-The whole history of a repository:
+The whole history of a repository. The walk follows the main line only
+(`git log --first-parent`); commits of a side branch arrive with their merge:
 
 ```bash
 python next_claude.py ~/code/xz
