@@ -53,7 +53,7 @@ import store
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
 
 CHUNK_TARGET_CHARS = 16_000
-KEY_ENV = {"voyage": "VOYAGE_API_KEY", "qwen": "DEEPINFRA_API_KEY"}
+KEY_ENV = {"voyage": "VOYAGE_API_KEY", "qwen": skills_lib.qwen_key_env()}
 OPEN = skills_lib.CODE_VEC_OPEN
 ALIVE_SECONDS = 900
 
@@ -99,6 +99,12 @@ def stored_ranges(body: str, raw_chunks):
     try:
         ranges = json.loads(raw_chunks)
     except (ValueError, TypeError):
+        return line_window_ranges(body)
+    # EMBED_WINDOW_LONG=1 (default 0 = as before): a body with no saved
+    # ranges is embedded in windows of CHUNK_TARGET_CHARS, not as one text.
+    # The provider limits one text in tokens (40,960 for Qwen3-Embedding-8B);
+    # a long, dense body (data files) goes over it and its whole batch fails.
+    if not ranges and os.environ.get("EMBED_WINDOW_LONG", "0") == "1":
         return line_window_ranges(body)
     return ranges or None
 

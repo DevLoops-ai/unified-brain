@@ -37,7 +37,7 @@ from ingester import GitDiffIngester
 
 load_dotenv(dotenv_path=os.path.join(os.path.dirname(os.path.abspath(__file__)), '.env'))
 
-_CODE_EMBED_KEYS = {"voyage": "VOYAGE_API_KEY", "qwen": "DEEPINFRA_API_KEY"}
+_CODE_EMBED_KEYS = {"voyage": "VOYAGE_API_KEY", "qwen": skills_lib.qwen_key_env()}
 
 
 def _db_clients(db_path: str) -> tuple:

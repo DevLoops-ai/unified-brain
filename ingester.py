@@ -63,7 +63,7 @@ LANG_BY_NAME = {
 
 TIER1 = ('python', 'typescript', 'tsx', 'javascript', 'c', 'cpp')
 TIER2 = ('bash', 'cmake', 'yaml', 'make')
-NO_PARSE = ('m4', 'asm', 'automake')   # regex extractors, no tree-sitter
+NO_PARSE = ('m4', 'asm', 'automake', 'markdown')   # own extractors, outside the code path
 
 # Languages symbolized at whole-file (<module>) level ONLY. Make/Automake
 # conditionals and variable blocks fragment badly under sub-file
@@ -1709,6 +1709,57 @@ def _blob_symbols(data, file_path):
              'embedded': []}]
 
 
+def _markdown_symbols(content, lines):
+    """INGEST_MARKDOWN=1. A Markdown file is cut at its headings, the way a
+    code file is cut at its functions: one piece per heading, holding the
+    heading line and the text under it up to the next heading of any level.
+    A table, a list or a fenced code block stays whole inside its piece (a
+    `#` line inside a code block is not a heading; the grammar knows).
+    The name is the path of headings ("Parent > Child"), so two "Example"
+    headings of one file stay apart. In a name `:` becomes ` -` and `,` is
+    dropped: both are separators elsewhere (def_key, <module> markers).
+    Text above the first heading (front matter, intro) is left to <module>.
+    A file with no heading stays one whole-file piece, as before."""
+    try:
+        tree = _parser('markdown').parse(content.encode('utf-8'))
+    except Exception:
+        return []
+    symbols = []
+
+    def last_line(node):
+        row, col = node.end_point
+        return row + (1 if col > 0 else 0)
+
+    def walk(node, path):
+        for sec in node.children:
+            if sec.type != 'section':
+                continue
+            kids = sec.children
+            head = kids[0] if kids and kids[0].type in (
+                'atx_heading', 'setext_heading') else None
+            if head is None:
+                walk(sec, path)
+                continue
+            first = lines[_line(head) - 1] if _line(head) <= len(lines) else ''
+            title = first.strip().lstrip('#').strip().rstrip('#').strip()
+            title = ' '.join(title.replace(':', ' -').replace(',', '').split())
+            here = path + [title or '(no title)']
+            sub = next((k for k in kids[1:] if k.type == 'section'), None)
+            start = _line(sec)
+            end = (_line(sub) - 1) if sub is not None else last_line(sec)
+            while end > start and not lines[end - 1].strip():
+                end -= 1
+            symbols.append({'name': ' > '.join(here), 'line': start,
+                            'structureType': 'section',
+                            'code': _truncate_body(
+                                '\n'.join(lines[start - 1:end]), 'markdown'),
+                            '_end': end})
+            walk(sec, here)
+
+    walk(tree.root_node, [])
+    return symbols
+
+
 def _text_symbols(content, lang_hint=''):
     """Tier 3. One <module> symbol carrying the whole file. Coarse — any edit
     marks the file modified — but the content is fully present for semantic
@@ -1729,7 +1780,11 @@ def _text_symbols(content, lang_hint=''):
 # ── Unified extraction entrypoint ─────────────────────────────────────────────
 
 def is_ingestable(path):
-    return not any(s in f'/{path}' for s in SKIP_PATHS)
+    # INGEST_SKIP_PATHS=/assets/,/src/ (default empty = as before): more
+    # path parts to leave out of the ingest, separated by commas.
+    extra = [p.strip() for p in
+             os.environ.get('INGEST_SKIP_PATHS', '').split(',') if p.strip()]
+    return not any(s in f'/{path}' for s in SKIP_PATHS + extra)
 
 
 def _is_binary(data):
@@ -1767,6 +1822,11 @@ def resolve_language(file_path, content):
     base = os.path.basename(file_path)
     ext = os.path.splitext(file_path)[1].lower()
     lang = LANG_BY_NAME.get(base)
+    # INGEST_MARKDOWN=1 (default 0 = whole file, as before): a .md file is
+    # cut at its headings, see _markdown_symbols.
+    if lang is None and ext == '.md' and content.strip() \
+            and os.environ.get('INGEST_MARKDOWN', '0') == '1':
+        return 'markdown', 2, None
     if lang is None and ext in TEXT_EXEMPT:
         return None, 3, None
     if lang is None:
@@ -1839,6 +1899,7 @@ _NO_PARSE_EXTRACTORS = {
     'm4':       _m4_symbols,
     'asm':      _asm_symbols,
     'automake': _automake_symbols,
+    'markdown': _markdown_symbols,
 }
 
 

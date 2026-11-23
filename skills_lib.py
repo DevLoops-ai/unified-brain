@@ -66,6 +66,21 @@ CODE_EMBED_SPECS = {
 # to_rank of a version that no later commit has replaced or deleted.
 CODE_VEC_OPEN = 2_000_000_000
 DEEPINFRA_OPENAI_BASE = "https://api.deepinfra.com/v1/openai"
+# ALL_VIA_OPENROUTER=1 (default 0 = as before): judges, question vector,
+# code vectors and writer all go through OpenRouter with OPENROUTER_API_KEY.
+# Embedding calls are pinned to DeepInfra inside OpenRouter, so new vectors
+# match the ones already stored.
+OPENROUTER_OPENAI_BASE = "https://openrouter.ai/api/v1"
+OPENROUTER_QWEN_MODEL = "qwen/qwen3-embedding-8b"
+OPENROUTER_EMBED_ROUTE = {"provider": {"order": ["deepinfra"],
+                                       "allow_fallbacks": False}}
+
+def all_via_openrouter() -> bool:
+    import os
+    return os.environ.get("ALL_VIA_OPENROUTER", "0") == "1"
+
+def qwen_key_env() -> str:
+    return "OPENROUTER_API_KEY" if all_via_openrouter() else "DEEPINFRA_API_KEY"
 # Qwen3-Embedding has no input_type: the QUERY side carries an instruction
 # prefix, the document side none. (Same string on every query — it is
 # part of the model's contract, not a prompt to tune per call.)
@@ -108,11 +123,12 @@ def grep_timing_take() -> dict:
 from openai import APIError, APIConnectionError, RateLimitError, InternalServerError
 
 def _embed_with_retry(openai_client: OpenAI, texts: list[str], max_retries: int = 5,
-                      *, model: str):
+                      *, model: str, extra_body: dict | None = None):
     for attempt in range(max_retries):
         try:
             return openai_client.embeddings.create(model=model, input=texts,
-                                                   encoding_format="float")
+                                                   encoding_format="float",
+                                                   extra_body=extra_body)
         except (RateLimitError, InternalServerError, APIConnectionError, APIError) as e:
             if attempt == max_retries - 1:
                 raise
@@ -159,10 +175,12 @@ class CodeEmbedder:
     Rows: <prefix>:<skill_id>:<commit>:<n> (FT-indexed),
     <prefix>_mean:<skill_id>:<commit>, <prefix>_ver:<skill_id>."""
 
-    def __init__(self, name: str, client):
+    def __init__(self, name: str, client, model: str | None = None,
+                 extra_body: dict | None = None):
         spec = CODE_EMBED_SPECS[name]
         self.name, self.client = name, client
-        self.model, self.dims = spec["model"], spec["dims"]
+        self.model, self.dims = model or spec["model"], spec["dims"]
+        self.extra_body = extra_body
         self.prefix, self.index = spec["prefix"], spec["index"]
 
     def index_schema(self) -> dict:
@@ -220,7 +238,8 @@ class CodeEmbedder:
             _url = os.environ.get("QUERY_EMBED_URL", "")
             _key = os.environ.get("QUERY_EMBED_API_KEY", "")
             _mdl = os.environ.get("QUERY_EMBED_MODEL", "")
-            if _url and _key and _mdl and self.name == "qwen":
+            if _url and _key and _mdl and self.name == "qwen" \
+                    and not all_via_openrouter():
                 try:
                     import httpx
                     r = httpx.post(
@@ -236,7 +255,8 @@ class CodeEmbedder:
                 except Exception as e:
                     print(f"⚠️  question vector from QUERY_EMBED_URL failed "
                           f"({type(e).__name__}): using DeepInfra")
-        resp = _embed_with_retry(self.client, batch, model=self.model)
+        resp = _embed_with_retry(self.client, batch, model=self.model,
+                                 extra_body=self.extra_body)
         return [d.embedding for d in resp.data]
 
     def embed(self, texts: list[str], input_type: str) -> list[bytes]:
@@ -271,6 +291,11 @@ def make_code_embedder(name: str, api_key: str) -> Optional["CodeEmbedder"]:
         return CodeEmbedder(name, voyageai.Client(api_key=api_key)) \
             if VOYAGE_AVAILABLE else None
     if name == "qwen":
+        if all_via_openrouter():
+            return CodeEmbedder(name, OpenAI(api_key=api_key,
+                                             base_url=OPENROUTER_OPENAI_BASE),
+                                model=OPENROUTER_QWEN_MODEL,
+                                extra_body=OPENROUTER_EMBED_ROUTE)
         return CodeEmbedder(name, OpenAI(api_key=api_key,
                                          base_url=DEEPINFRA_OPENAI_BASE))
     raise ValueError(f"unknown code embedder {name!r}")

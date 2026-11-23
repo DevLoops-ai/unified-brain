@@ -155,7 +155,7 @@ _VECTOR_STORE: contextvars.ContextVar[str] = contextvars.ContextVar(
     "vector_store", default=QA_VECTOR_STORE_DEFAULT)
 
 CODE_EMBEDDERS: dict = {}
-for _n, _k in (("voyage", "VOYAGE_API_KEY"), ("qwen", "DEEPINFRA_API_KEY")):
+for _n, _k in (("voyage", "VOYAGE_API_KEY"), ("qwen", skills_lib.qwen_key_env())):
     _e = skills_lib.make_code_embedder(_n, os.getenv(_k, ""))
     if _e is not None:
         CODE_EMBEDDERS[_n] = _e
@@ -404,6 +404,17 @@ def _expand_composite_members(org_redis, skill: dict, as_of=None,
 
 
 
+def _qa_skipped(path: str) -> bool:
+    """QA_SKIP_PATHS=/src/,/assets/ : files the answers leave out, with no
+    new ingest. Same form as INGEST_SKIP_PATHS: a file is left out when its
+    path, with a `/` in front, contains one of the parts. The bodies stay
+    in the index; the search and the chains do not use them. Empty (the
+    default) = nothing is left out."""
+    parts = [p.strip() for p in os.environ.get("QA_SKIP_PATHS", "").split(",")
+             if p.strip()]
+    return bool(parts) and any(s in f"/{path}" for s in parts)
+
+
 def _knn_candidates(question, org_redis_binary, *, embedding, top_k,
                     include_obsolete, store: str,
                     atomics_only=False, as_of=None) -> list[tuple[str, float]]:
@@ -465,6 +476,9 @@ def _knn_candidates(question, org_redis_binary, *, embedding, top_k,
                 dk = dk.decode() if isinstance(dk, bytes) else dk
                 if atomics_only and not dk:
                     continue                  # composite row: it has no def_key
+                _p = skills_lib.parse_def_key(dk) if dk else None
+                if _p and _qa_skipped(_p[0]):
+                    continue                  # QA_SKIP_PATHS
                 if sid and score > best.get(sid, float("-inf")):
                     best[sid] = score
             print(f"🧭 code knn [{store}]: asked {n_rows} rows, got {len(rows)}, "
@@ -753,6 +767,9 @@ def _sse_event(payload: dict) -> str:
 # Not set = OpenRouter with OPENROUTER_API_KEY, as before.
 JEV_URL = os.environ.get("JEV_URL") or "https://openrouter.ai/api/alpha/decisions"
 JEV_KEY = os.environ.get("JEV_API_KEY") or os.environ.get("OPENROUTER_API_KEY", "")
+if skills_lib.all_via_openrouter():
+    JEV_URL = "https://openrouter.ai/api/alpha/decisions"
+    JEV_KEY = os.environ.get("OPENROUTER_API_KEY", "")
 JEV_MODEL = os.environ.get("JEV_MODEL", "typesafe/jev-1.13")   # or cloudflare/clef-flash
 # Optional second judge for the two places where few calls decide a lot:
 # the seed scoring and the hit triage. Empty = same model as JEV_MODEL.
@@ -1007,6 +1024,13 @@ def _jev_select(question: str, org_redis,
 _NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{3,}")
 # JEV_NAMES_ALL=1: a name of any length (`id`, `url`, `len`).
 _NAME_ANY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# JEV_NAMES_TEXT=1 (default 0 = code names, as before): words of plain text.
+# Letters of any language, a hyphenated word stays one word (`two-factor`,
+# `manual-totp-app-setup`), and a word may start with a digit if it has a
+# letter (`2FA`). Not for code: there `a-b` is a subtraction.
+if os.environ.get("JEV_NAMES_TEXT", "0") == "1":
+    _NAME_RE = re.compile(r"(?=[\w-]{4})(?=[\w-]*[^\W\d])\w+(?:-\w+)*")
+    _NAME_ANY_RE = re.compile(r"(?=[\w-]*[^\W\d])\w+(?:-\w+)*")
 # a name in member position: `->name` or `.name`
 _MEMBER_RE = re.compile(r"(?:->|\.)\s*([A-Za-z_][A-Za-z0-9_]{3,})")
 
@@ -1863,6 +1887,8 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
     # and turns off the blind text search of whole-file bodies, whose
     # names Jev now picks.
     names_all = os.environ.get("JEV_NAMES_ALL", "0") == "1"
+    # JEV_POINTERS=1: see (d) in _candidates. 0 = as before.
+    pointers = os.environ.get("JEV_POINTERS", "0") == "1"
     helper_min   = float(os.environ.get("JEV_HELPER_MIN_ACCEPT", "0"))
     # JEV_HELPER_KEEP=1: a helper is attached only when Jev itself says the
     # writer needs it (one more yes/no question in the body's own call, no
@@ -2036,6 +2062,55 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                                    "which the judge chose to follow"})
         return out
 
+    def _pointed(n: dict) -> list[dict]:
+        """JEV_POINTERS=1: the places a body points to without the judge
+        having to choose their names. Used for every body the chain reads,
+        seed or not. All of them go through the "(definitions)" triage,
+        where the judge sees the first lines of each place.
+         - A name used in the body that is not a symbol but is the name of
+           a file: that file. An article that includes another file by its
+           name means "the text of that file belongs here"; as one name
+           among all the words of the body it loses the name choice.
+         - For the top piece of a file that was cut at its headings
+           (INGEST_MARKDOWN): the sections cut out of it."""
+        if not pointers or want is not None or as_of is not None:
+            return []
+        text = n["body"] or ""
+        if not names_all:
+            text = text[:20000]
+        names: list[str] = []
+        for t in _NAME_RE.findall(text):
+            if t not in names:
+                names.append(t)
+        if not names_all:
+            names = names[:200]
+        res: list[dict] = []
+        if names:
+            pipe = org_redis.pipeline(transaction=False)
+            for t in names:
+                pipe.scard(f"symbol_name:{t}")
+            for t, c in zip(names, pipe.execute()):
+                if int(c or 0) == 0:
+                    got = _file_places(t)
+                    if 1 <= len(got) <= max_defs:
+                        res += [{**d, "why": f"it defines `{t}`: it is the file "
+                                             f"named `{t}`, which is named there"}
+                                for d in got if d["file"] != n["file"]]
+        if n["symbol"] == "<module>":
+            for sk in sorted(_decode_set(org_redis.smembers(
+                    f"file_symbols:{n['file']}"))):
+                dk = sk[len("symbol:"):]
+                p = skills_lib.parse_def_key(dk)
+                if p and p[3] == "section":
+                    sec = skills_lib.get_code(org_redis, dk)
+                    if sec:
+                        res.append({"file": p[0], "symbol": p[1],
+                                    "line": int(p[2]), "struct": p[3],
+                                    "body": sec, "hit": None,
+                                    "why": f"it defines `{p[1]}`: a section "
+                                           "of this file"})
+        return res
+
     def _candidates(n: dict) -> list[dict]:
         body = n["body"] or ""
         lines = body.splitlines()
@@ -2146,7 +2221,7 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                 # and the blind opening of definitions below still runs.
                 picked_first = list(n.get("extra") or []) + chosen
             elif triage_defs:
-                return list(n.get("extra") or []) + chosen + out
+                return list(n.get("extra") or []) + chosen + out + _pointed(n)
             elif triage_on:
                 return list(n.get("extra") or []) + chosen + out[:per_node]
             else:
@@ -2187,12 +2262,33 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                 for d in defs:
                     out.append({**d, "hit": None,
                                 "why": f"it defines `{t}`, which is used there"})
+        # (d) JEV_POINTERS=1 (default 0 = as before): two more kinds of
+        # definition, for text that is spread over files (a help centre).
+        # Both go through the same triage as (c), where the judge sees the
+        # first lines of each place and decides from the content, not from
+        # the name.
+        #  - A name used here that is not a symbol but is the name of a
+        #    file: that file. An article that includes another file by its
+        #    name means "the text of that file belongs here"; as one name
+        #    among all the words of the body it loses the name choice.
+        #  - For the top piece of a file that was cut at its headings
+        #    (INGEST_MARKDOWN): the sections cut out of it. Their names are
+        #    several words long, so no name search reaches them.
+        out += _pointed(n)
         blind = out if triage_defs else out[:per_node]
         if picked_first is None:
             return blind
         have = {(c["file"], c["symbol"], c["line"]) for c in picked_first}
         return picked_first + [c for c in blind
                                if (c["file"], c["symbol"], c["line"]) not in have]
+
+    if os.environ.get("QA_SKIP_PATHS", "").strip():
+        # QA_SKIP_PATHS: the chains do not open a place in a left-out file
+        _all_candidates = _candidates
+
+        def _candidates(n: dict) -> list[dict]:
+            return [c for c in _all_candidates(n)
+                    if not _qa_skipped(c.get("file") or "")]
 
     def _excerpt(body: str, hit: Optional[int]) -> tuple[str, bool]:
         return _jev_excerpt(body, hit, body_cap)
@@ -3684,6 +3780,13 @@ PROVIDER_DEFAULTS = {
         "api_base":     "https://api.isoquant.ai/v1",
         "extra_params": {"extra_headers": {"Isoquant-ZDR": "required"}},
     },
+    "openrouter": {
+        # Used when ALL_VIA_OPENROUTER=1. Key: OPENROUTER_API_KEY.
+        # Another model: OPENROUTER_LLM_MODEL.
+        "model":        "openai/deepseek/deepseek-v4.1-flash",
+        "api_base":     "https://openrouter.ai/api/v1",
+        "extra_params": {},
+    },
 }
 
 _llm_cache: Optional[LLMTarget] = None
@@ -3695,10 +3798,20 @@ def _llm_target() -> LLMTarget:
     if _llm_cache is not None:
         return _llm_cache
     provider = (os.getenv("LLM_PROVIDER") or "llmbase").lower()
+    if skills_lib.all_via_openrouter():
+        provider = "openrouter"
     defaults = PROVIDER_DEFAULTS.get(provider)
     if defaults is None:
         raise ValueError(f"Unknown LLM_PROVIDER {provider!r}; "
                          f"choose one of {sorted(PROVIDER_DEFAULTS)}")
+    if provider == "openrouter":
+        key = os.getenv("OPENROUTER_API_KEY", "")
+        if not key:
+            raise MissingSecret("OPENROUTER_API_KEY is not set in .env")
+        _llm_cache = LLMTarget(
+            provider, os.getenv("OPENROUTER_LLM_MODEL") or defaults["model"],
+            key, defaults["api_base"], defaults["extra_params"])
+        return _llm_cache
     key = os.getenv("LLM_API_KEY", "")
     if not key:
         raise MissingSecret("LLM_API_KEY is not set in .env")
