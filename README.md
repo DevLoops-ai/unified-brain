@@ -20,7 +20,7 @@ The agent spawned from unified-brain runs through MCP on Cursor, OpenCode or Cla
 
 The evals on two large OS libraries (xz and open62541, in `evals/` on this repo) are close enough to the frontier agents, at a fraction of their cost, that I believe this is a missing link to make AI more reliable.
 
-Since 23/11/2026 it also answers from plain Markdown, not only from code. On GitHub's own help centre its high-reasoning mode reached 47.75 of 50 points, 0.75 behind a Claude Fable 5.2 agent at high effort (48.5), at an estimated 20 to 40 times lower cost; its fast mode reached 46.0 in a sixth of the agent's time (see "Not only code" below).
+Since 23/11/2026 it also answers from plain Markdown, not only from code. On GitHub's own help centre its high-reasoning mode reached 47.75 of 50 points, 0.75 behind a Claude Fable 5.2 agent at high effort (48.5), at 41 times lower cost ($0.091 against $3.76; the footnotes there say how each figure is made); its fast mode reached 46.0 in a sixth of the agent's time (see "Not only code" below).
 
 This is because the limits holding back AI are:
 
@@ -28,7 +28,7 @@ This is because the limits holding back AI are:
 
 The LLM turn reasoning it is introducing uncertainty and probabilistic outcomes.
 
-BUT.. Unified-brain's System One discovery engine breaks the task into hundreds of yes-or-no calls, so the search itself does not reason in prose and cannot "hallucinate" -at least in the sense of prose drifting- a path.
+BUT.. Unified-brain's System One discovery engine breaks the task into hundreds of yes-or-no calls, so the search itself does not reason in prose and while a single decision can be wrong, no path can be invented -at least in the sense of prose drifting.
 
 - **Context Loss and Memory Limits**:
 
@@ -88,20 +88,21 @@ Full also equals a Claude Opus 5.5 agent (70 / 74) and is above a Claude Fable 5
 
 | Mode | Score | Share of the agent's points | Wrong claims | Time, nine questions | Cost, nine questions |
 |---|---|---|---|---|---|
-| **High-reasoning** (writer thinks first; everything through OpenRouter) | 47.75 / 50 (95.5 %) | 98.5 % | 1 | 397 s (44 s per answer) | about $0.10 to $0.15 ² |
+| **High-reasoning** (writer thinks first; everything through OpenRouter) | 47.75 / 50 (95.5 %) | 98.5 % | 1 | 397 s (44 s per answer) | $0.091 ² |
 | **Fast** (writer does not think; direct providers) | 46.0 / 50 (92.0 %) | 94.8 % | 1 | 57 s (6.4 s per answer) | writer $0.007; judge not reported ³ |
-| Claude Fable 5.2 agent, high effort | 48.5 / 50 (97.0 %) | — | 0 found | 359 s (40 s per answer) | about $3 to $4 (estimated) |
+| Claude Fable 5.2 agent, high effort | 48.5 / 50 (97.0 %) | — | 0 found | 359 s (40 s per answer) | $3.76 ⁴ |
 
-² Judge $0.070, measured. The writer's cost was not recorded; it is estimated from its tokens (103,771 in, 26,497 out) at the prices OpenRouter's providers post for DeepSeek V4.1 Flash, $0.15 / $0.60 to $0.375 / $1.50 per million: $0.03 to $0.08.
-³ The fast run used the direct TypeSafe key, which reports no cost.
+² Judge $0.070, as billed by OpenRouter (the answer footers). Writer $0.021: its measured tokens (103,771 in, 26,497 out) at the weighted average price OpenRouter's customers pay for DeepSeek V4.1 Flash ($0.02555 in, $0.6891 out per million, read 2026-11-23). OpenRouter picks a provider per request and the footer does not record which, so the writer's part is priced, not billed; at the cheapest and the dearest provider it would be $0.011 and $0.094.
+³ Writer: its measured tokens at Isoquant's price. The fast run used the direct TypeSafe key, which reports no cost. The same judge work cost $0.070 through OpenRouter in the high-reasoning run (93 seeds and 168 bodies against 92 and 169).
+⁴ The harness reported one figure for the agent: 188,180 tokens, 47 tool calls. Priced with the method of `qa-xz-2026-11-13-fable-5-2-agents.md` at Anthropic's list prices for Fable 5.2 with prompt caching on: cache write $1.88, cache read $0.90 to $1.81, output $0.52 (the nine answers only; no thinking tokens), so $3.30 to $4.21. The table uses the middle. It is a floor, not a bill.
 
 How to read the table:
 
-- High-reasoning is 0.75 points (1.5 percentage points) behind the agent, at an estimated 20 to 40 times lower cost. It is not faster than the agent: 397 s against 359 s. Almost half of its time (190 s) is one step, the question's vector fetched through OpenRouter; with the direct provider that step took about 1 s per question.
+- High-reasoning is 0.75 points (1.5 percentage points) behind the agent, at 41 times lower cost ($0.091 against $3.76). It is not faster than the agent: 397 s against 359 s. Almost half of its time (190 s) is one step, the question's vector fetched through OpenRouter; with the direct provider that step took about 1 s per question.
 - Fast is 2.5 points behind the agent and 6 times faster.
 - The two modes differ in two things at once (the writer's thinking and the provider route), so the 1.75 points between them cannot be credited to thinking alone. What is measured: the evidence was the same in both (93 and 92 seeds, 168 and 169 bodies), and the points lost by the writer fell from 3.25 to 1.5. Evidence gathering lost 0.75 in both.
 - A help article does not hold all its text: it includes shared files by name (`{% data reusables.a.b %}`). Following those names is what `JEV_POINTERS=1` does; the same questions scored 42.75 that morning, before it and `QA_SKIP_PATHS` existed.
-- The agent was one agent for all nine questions, which is an easier setting than one fresh agent per question. Its cost is an estimate from the tokens the harness reported, not a bill.
+- The agent was one agent for all nine questions, which is an easier setting than one fresh agent per question. Its cost is priced from the one token figure the harness reported (footnote ⁴), not a bill.
 - One question (Q5) is the one the two new switches were developed on. One run per question, one grader (Claude Fable) for all three rows.
 - Sources: `evals/results/qa-github-docs-2026-11-23-openrouter-reasoning-high.md`, `qa-github-docs-2026-11-23-pointers.md` (fast) and `qa-github-docs-2026-11-23-fable-5-2-agent.md` (the agent; its answers are in `evals/runs/fable-5-2-high-github-docs-2026-11-23/`).
 
