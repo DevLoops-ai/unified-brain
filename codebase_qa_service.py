@@ -604,6 +604,70 @@ def _plain_markers(code: str, file_path: str, where: dict) -> str:
     return _MARKER_RE.sub(_one, code)
 
 
+def _inline_tags(code: str, store, _seen: tuple = ()) -> str:
+    """QA_INLINE_TAG='{% data PATH %}': a body as the writer reads it, with
+    each tag of that shape replaced by the value its PATH points to in the
+    index. `{% data variables.product.prodname_pages %}` becomes
+    `GitHub Pages`, the value of the key `prodname_pages` in the file
+    `variables/product.yml`. The writer then reads the sentence as the end
+    user sees it, and has no raw tag to copy into its answer.
+
+    The setting gives only the shape of a tag (source syntax, like a
+    heading); every value comes from the index at question time and nothing
+    is kept. A tag is replaced only when its PATH ends at exactly one key
+    with a plain value; a PATH that points to a whole file (an included
+    text), to nothing, or to several places stays as it is. Not set (the
+    default): the body as stored."""
+    spec = os.environ.get("QA_INLINE_TAG", "").strip()
+    if "PATH" not in spec:
+        return code
+    tag = re.compile(r"\s*".join(re.escape(t) for t in spec.split())
+                     .replace("PATH", r"(?P<path>[\w.-]+)"))
+    found: dict[str, Optional[str]] = {}
+
+    def _value(path: str) -> Optional[str]:
+        parts = path.split(".")
+        if len(parts) < 2 or path in _seen:
+            return None
+        key, stem = parts[-1], parts[-2]
+        folder = parts[-3] if len(parts) > 2 else None
+        hits = []
+        for sk in _decode_set(store.smembers(f"symbol_name:{key}")):
+            dk = sk[len("symbol:"):]
+            p = skills_lib.parse_def_key(dk)
+            if not p or _qa_skipped(p[0]) or p[1] != key \
+                    or os.path.splitext(os.path.basename(p[0]))[0] != stem \
+                    or (folder and os.path.basename(os.path.dirname(p[0])) != folder):
+                continue
+            hits.append(dk)
+        if len(hits) != 1:
+            return None
+        lines = skills_lib.get_code(store, hits[0]).splitlines()
+        for i, line in enumerate(lines):
+            if not line.startswith(key + ":"):
+                continue
+            rest = line[len(key) + 1:].strip()
+            if rest[:1] in (">", "|"):           # a block of text under the key
+                block = [x.strip() for x in lines[i + 1:] if x.strip()]
+                rest = (" " if rest[0] == ">" else "\n").join(block)
+            elif len(rest) >= 2 and rest[0] == rest[-1] and rest[0] in "'\"":
+                rest = (rest[1:-1].replace("''", "'") if rest[0] == "'"
+                        else rest[1:-1])
+            if not rest:
+                return None                       # the key holds other keys
+            # a value may itself use a tag of the same shape
+            return _inline_tags(rest, store, _seen + (path,))
+        return None
+
+    def _one(m):
+        path = m.group("path")
+        if path not in found:
+            found[path] = _value(path)
+        return m.group(0) if found[path] is None else found[path]
+
+    return tag.sub(_one, code)
+
+
 def _build_context(skills: list[dict], shown_bodies: Optional[dict] = None) -> str:
     # identical text once: the first copy stays, the others become a note on it
     firsts: dict[str, dict] = {}
@@ -654,6 +718,7 @@ def _build_context(skills: list[dict], shown_bodies: Optional[dict] = None) -> s
             else:
                 _code = (_plain_markers(s["code"], s.get("file_path") or "", _where)
                          if _plain else s["code"])
+                _code = _inline_tags(_code, _redis_clients()[0])
                 body += f"\n\n**Source code:**\n```typescript\n{_code.rstrip()}\n```"
         elif s.get("is_composite"):
             body += "\n\n**Source code:** (composite — no single body)"
@@ -3424,6 +3489,12 @@ async def _final_answer_stream(question, retrieved_context, evidence, synth_targ
                                mode, max_tokens, token_stats):
     style = ("Plain English, no jargon." if mode == "plain"
              else "Technical precision; cite exact symbols, files, and lines.")
+    # WRITER_AUDIENCE: who reads the answer, in the profile's own words.
+    # When set, it takes the place of the style line above. Not set (the
+    # default): the style line as it was.
+    audience = os.environ.get("WRITER_AUDIENCE", "").strip()
+    if audience:
+        style = f"The reader is {audience}"
     system = (
         "You are DevLoops. An investigation has already gathered evidence from the "
         "codebase by following names through the code. Write the final, complete answer "
