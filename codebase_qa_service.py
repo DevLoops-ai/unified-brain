@@ -557,6 +557,24 @@ _MARKER_RE = re.compile(
     r"^(?P<c>\S+) … lines (?P<lo>\d+)-(?P<hi>\d+) elided by DevLoops "
     r"\((?P<d>.*)\) …$", re.M)
 _MARKER_ITEM_RE = re.compile(r"^(?P<n>.+?) \[(?P<t>[^\]]+)\] @(?P<l>\d+)$")
+_BLANK_MARKER_RE = re.compile(
+    r"^\S+ … lines \d+-\d+ elided by DevLoops \(blank\) …$", re.M)
+
+
+def _judge_body(code: str) -> str:
+    """JEV_PLAIN_BLANKS=1: a body as the judge reads it. Where a file-level
+    body had blank lines the ingester stores one marker line
+    (`# … lines 2-2 elided by DevLoops (blank) …`). In prose with a blank
+    line after every paragraph that is one marker for every line of text,
+    and the triage, which shows the first lines of a place, shows half
+    markers. Each marker line becomes an empty line: the number of lines
+    stays the same, so every line position stays valid. The writer already
+    gets this through QA_PLAIN_MARKERS. Off (the default): the body as
+    stored."""
+    if os.environ.get("JEV_PLAIN_BLANKS", "0") != "1" \
+            or "elided by DevLoops (blank)" not in code:
+        return code
+    return _BLANK_MARKER_RE.sub("", code)
 
 
 def _plain_markers(code: str, file_path: str, where: dict) -> str:
@@ -875,7 +893,8 @@ def _jev_select(question: str, org_redis,
             if not body and as_of is not None:
                 # No per-commit copy stored: same fallback as get_code_as_of.
                 body = skills_lib.get_code(org_redis, dk)
-            cands.append({"sid": sid, "sk": sk, "dk": dk, "p": p, "body": body})
+            cands.append({"sid": sid, "sk": sk, "dk": dk, "p": p,
+                          "body": _judge_body(body)})
 
     if on_cands is not None:
         on_cands(cands)        # the bodies are known: the caller may search ahead
@@ -2031,14 +2050,9 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
 
     _file_index: dict[str, list[str]] = {}
 
-    def _file_places(name: str) -> list[dict]:
-        """Whole-file bodies of the files whose basename or stem is `name`.
-        A followed file name must reach the file itself, not only the
-        bodies that mention it (`test_compress` -> tests/test_compress.sh;
-        the mention grep finds the wrappers and never the script).
-        Current state only; a windowed read keeps the mention path."""
-        if want is not None or as_of is not None or len(name) < 4:
-            return []
+    def _file_keys(name: str) -> list[str]:
+        """The keys of the whole-file bodies whose basename or stem is
+        `name`. The index is built once, on first use."""
         if not _file_index:
             for sym in ("<module>", "<blob>"):
                 for sk in _decode_set(org_redis.smembers(f"symbol_name:{sym}")):
@@ -2047,7 +2061,17 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                         b = os.path.basename(p[0])
                         for k in {b, os.path.splitext(b)[0]}:
                             _file_index.setdefault(k, []).append(sk)
-        keys = _file_index.get(name, [])
+        return _file_index.get(name, [])
+
+    def _file_places(name: str) -> list[dict]:
+        """Whole-file bodies of the files whose basename or stem is `name`.
+        A followed file name must reach the file itself, not only the
+        bodies that mention it (`test_compress` -> tests/test_compress.sh;
+        the mention grep finds the wrappers and never the script).
+        Current state only; a windowed read keeps the mention path."""
+        if want is not None or as_of is not None or len(name) < 4:
+            return []
+        keys = _file_keys(name)
         if len(keys) > max_hits:
             return []          # a file name used this often is "everywhere", as in _mentions
         out = []
@@ -2091,11 +2115,40 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                 pipe.scard(f"symbol_name:{t}")
             for t, c in zip(names, pipe.execute()):
                 if int(c or 0) == 0:
-                    got = _file_places(t)
+                    got = [d for d in _file_places(t)
+                           if not _qa_skipped(d["file"])]
                     if 1 <= len(got) <= max_defs:
                         res += [{**d, "why": f"it defines `{t}`: it is the file "
                                              f"named `{t}`, which is named there"}
                                 for d in got if d["file"] != n["file"]]
+        # A path written in the text with dots or slashes
+        # (`reusables.gated-features.pages`, `/actions/reference/limits`,
+        # `data/reusables/a/b.md`) whose last two parts are a folder and a
+        # file in that folder: that file. Folder and file name together are
+        # not ambiguous, so it does not matter here that a symbol has the
+        # same name or that many files do (`pages`: a YAML key and 17 files).
+        have = {(d["file"], d["symbol"]) for d in res}
+        for m in re.finditer(r"[\w-]+(?:[./][\w-]+)+", text):
+            parts = m.group(0).replace("/", ".").split(".")
+            for folder, stem in {(parts[i], parts[i + 1])
+                                 for i in (len(parts) - 2, len(parts) - 3)
+                                 if i >= 0}:
+                for sk in _file_keys(stem):
+                    dk = sk[len("symbol:"):]
+                    p = skills_lib.parse_def_key(dk)
+                    if not p or (p[0], p[1]) in have or p[0] == n["file"] \
+                            or os.path.basename(os.path.dirname(p[0])) != folder \
+                            or _qa_skipped(p[0]):
+                        continue
+                    sec = skills_lib.get_code(org_redis, dk)
+                    if sec:
+                        have.add((p[0], p[1]))
+                        res.append({"file": p[0], "symbol": p[1],
+                                    "line": int(p[2]), "struct": p[3],
+                                    "body": sec, "hit": None,
+                                    "why": f"it defines `{folder}/{stem}`: it is "
+                                           "the file at that path, which is "
+                                           "named there"})
         if n["symbol"] == "<module>":
             for sk in sorted(_decode_set(org_redis.smembers(
                     f"file_symbols:{n['file']}"))):
@@ -2290,6 +2343,14 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
             return [c for c in _all_candidates(n)
                     if not _qa_skipped(c.get("file") or "")]
 
+    if os.environ.get("JEV_PLAIN_BLANKS", "0") == "1":
+        # JEV_PLAIN_BLANKS: the judge reads bodies without blank-line markers
+        _raw_candidates = _candidates
+
+        def _candidates(n: dict) -> list[dict]:
+            return [{**c, "body": _judge_body(c.get("body") or "")}
+                    for c in _raw_candidates(n)]
+
     def _excerpt(body: str, hit: Optional[int]) -> tuple[str, bool]:
         return _jev_excerpt(body, hit, body_cap)
 
@@ -2307,7 +2368,7 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
             "root_i": i,
             "file": s.get("file_path", ""), "symbol": s.get("symbol", ""),
             "line": int(p[2]) if p else 0, "struct": p[3] if p else "",
-            "body": s.get("code") or "", "hit": s.get("hit"),
+            "body": _judge_body(s.get("code") or ""), "hit": s.get("hit"),
             "chain": s.get("chain") or (
                 f"`{s.get('symbol') or s.get('name')}` in "
                 f"{s.get('file_path', '')} was judged relevant to the question"),
@@ -2650,6 +2711,17 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                         c["triage_p"] = probs.get(i)
                         if probs.get(i) is not None and probs[i] < cut:
                             dropped.add(id(c)); skipped += 1
+                    if os.environ.get("JEV_TRIAGE_LOG", "0") == "1":
+                        # every place of the group with the judge's answer,
+                        # highest first, so a skipped place can be found
+                        print(f"🔎 triage `{name}` from {n['file']} `{n['symbol']}`: "
+                              + " · ".join(
+                                  f"{probs[i]:.2f} {os.path.basename(c['file'])}"
+                                  f" `{c['symbol']}`"
+                                  for i, c in sorted(
+                                      enumerate(g),
+                                      key=lambda t: -(probs.get(t[0]) or 0))
+                                  if probs.get(i) is not None))
                     return name, len(g), skipped, c_, n.get("root_i")
 
                 if work:
