@@ -1250,6 +1250,154 @@ def _jev_excerpt(body: str, hit: Optional[int], cap: int) -> tuple[str, bool]:
     return "\n".join(lines[lo:hi + 1])[:cap], True
 
 
+# JEV_SPLIT_LONG=1 (default 0 = as before: one call on the part around the
+# link). A body too long for one Jev call is judged whole, in parts: each
+# part is judged in a call of its own with the same question. The body keeps
+# the most permissive answer of its parts and the names to follow of every
+# part that was not rejected. The writer gets the parts that were kept, in
+# their order, with a note where a part is left out.
+#
+# A part is as long as fits in one call TOGETHER WITH that call's own
+# questions (the list of names to choose from can be longer than the code)
+# and its fixed fields. This is worked out before the call from the real
+# lengths; no call is sent to find out. The code of earlier steps gets the
+# room that is left.
+def _split_long() -> bool:
+    return os.environ.get("JEV_SPLIT_LONG", "0") == "1"
+
+
+def _jlen(text) -> int:
+    """Length of a text as it travels to Jev (JSON: a line end is two
+    characters). The characters-per-token figure is measured on this form."""
+    return len(json.dumps(text, ensure_ascii=False)) - 2
+
+
+def _jev_call_room() -> int:
+    """Characters one Jev call may carry in all, state and questions
+    together: JEV_STATE_MAX_TOKENS x the fewest characters per token Jev has
+    reported. Until that is known, JEV_BODY_MAX_CHARS."""
+    old = int(os.environ.get("JEV_BODY_MAX_CHARS", "60000"))
+    limit = int(os.environ.get("JEV_STATE_MAX_TOKENS", "0") or 0)
+    cpt = _JEV_SEEN["chars_per_token"]
+    if limit <= 0 or cpt is None:
+        return old
+    return int(limit * cpt)
+
+
+def _questions_chars(instructions: str, names: list) -> int:
+    """Characters of the questions of one verdict call with these names
+    (_jev_verdict_names_one): the verdict question, the yes/no questions
+    asked next to it (each under 300 characters; four at most), and the
+    choice over the names. More than 254 names go out in groups, each in a
+    call of its own; the longest group counts."""
+    base = (_jlen(instructions) + _jlen(json.dumps(_JEV_VERDICTS))
+            + _jlen(_DERIVED_INSTRUCTIONS) + 4 * 300)
+    if not names or not _names_as_choice():
+        return base
+    room = _JEV_MAX_CHOICES - 1
+    return base + max(
+        sum(2 * _jlen(n) + 24 for n in names[i:i + room])
+        for i in range(0, len(names), room))
+
+
+
+
+def _fit_travel(build, room: int) -> str:
+    """`build(n)` makes a text of about n plain characters. Returns the
+    text for the largest n whose travelling length (_jlen) is within
+    `room`: built, measured, and built smaller by what it was over."""
+    n = room
+    text = build(n)
+    for _ in range(6):
+        over = _jlen(text) - room
+        if over <= 0:
+            break
+        n -= over
+        text = build(n)
+    return text
+
+
+def _plan_parts(text: str, first: int, count: int, room: int,
+                overhead) -> list[tuple[str, int, int]]:
+    """The parts a body is judged in: (text, index of its first line,
+    number of lines), in order; every character of the body is in exactly
+    one part. `overhead(text, first, count)` gives the characters a call on
+    that text needs next to the text itself (its questions and fixed
+    fields).
+
+    A text that fits with its overhead is one part. One that does not is
+    cut at a line end and each piece is looked at again, since a shorter
+    text also has fewer names to ask about. A line is cut inside only when
+    it does not fit alone. Then neighbours that fit together in one call
+    are put together again, so no call goes out half empty. When even an
+    empty text would not fit (the fixed fields alone fill the room), the
+    text is left as it is: cutting would not help."""
+    lines = text.splitlines() or [text]
+
+    def need(txt: str, lo: int, n: int) -> int:
+        return _jlen(txt) + overhead(txt, first + lo, n)
+
+    def size_for(txt: str, lo: int, n: int) -> int:
+        # in proportion to what is over, but never below half: the
+        # overhead gets smaller with the text, so half may already fit
+        over = overhead(txt, first + lo, n)
+        half = (len(txt) + 1) // 2
+        if over >= room:
+            return half
+        return min(len(txt) - 1,
+                   max(half, int(len(txt) * (room - over) / _jlen(txt))))
+
+    def chars(txt: str, lo: int) -> list:
+        """One line that does not fit alone, cut inside the line."""
+        if need(txt, lo, 1) <= room or len(txt) < 2:
+            return [(txt, lo, 1, False)]
+        k = size_for(txt, lo, 1)
+        return [p for a in range(0, len(txt), k)
+                for p in chars(txt[a:a + k], lo)]
+
+    def plan(lo: int, hi: int) -> list:
+        txt = "\n".join(lines[lo:hi])
+        if need(txt, lo, hi - lo) <= room or len(txt) < 2:
+            return [(txt, lo, hi - lo, True)]
+        if hi - lo == 1:
+            return chars(txt, lo)
+        size = size_for(txt, lo, hi - lo)
+        out, a, used = [], lo, 0
+        for i in range(lo, hi):
+            if i > a and used + len(lines[i]) + 1 > size:
+                out += plan(a, i)
+                a, used = i, 0
+            used += len(lines[i]) + 1
+        if a == lo:                    # one line holds nearly all of it
+            mid = (lo + hi) // 2
+            return plan(lo, mid) + plan(mid, hi)
+        return out + plan(a, hi)
+
+    if overhead("", first, 0) >= room:
+        return [(text, first, len(lines))]
+    parts = plan(0, len(lines))
+    merged: list = []
+    for p in parts:
+        if merged and merged[-1][3] and p[3]:
+            q = merged[-1]
+            both = q[0] + "\n" + p[0]
+            if need(both, q[1], q[2] + p[2]) <= room:
+                merged[-1] = (both, q[1], q[2] + p[2], True)
+                continue
+        merged.append(p)
+    return [(t, first + lo, n) for t, lo, n, _whole in merged]
+
+
+def _most_permissive(answers: list) -> int:
+    """Index of the most permissive of several (verdict, probabilities):
+    accept before continue before reject; between equals, the lower
+    reject."""
+    rank = {"accept": 0, "continue": 1}
+    return min(range(len(answers)), key=lambda i: (
+        rank.get(answers[i][0], 2),
+        float((answers[i][1] or {}).get("reject", 1.0))))
+
+
 def _settle(verdict, probs):
     """Jev's label, except: a reject it is not sure about becomes continue."""
     sure = float(os.environ.get("JEV_SURE_REJECT", "0.75"))
@@ -1461,7 +1609,71 @@ def _fmt_picks(picks: dict) -> str:
     return (" names: " + " ".join(f"{n}={p:.2f}" for n, p in top)) if top else ""
 
 
-def _jev_triage_hits(client, state: dict, hits: list[dict], around: int = JEV_TRIAGE_AROUND):
+def _triage_question(i: int) -> dict:
+    """The hit triage's question about place [i]."""
+    return {
+        "type": "noul",
+        "instructions": (f"Would reading the whole body of place [{i}] in `places` "
+                         "help answer the `question`, given what is "
+                        "`already_established`? A test, an example or another "
+                         "platform's copy of the same function helps only if the "
+                         "question is about that. A translation or localisation "
+                         "catalog, or another derived copy of text that exists "
+                         "elsewhere in its original form, does not help. A build file, a configure "
+                         "script or a configuration that names the file reached "
+                         "from decides when that file is compiled or used; it "
+                         "helps when the question asks under which conditions, "
+                         "on which platforms or with which options something "
+                         "happens."),
+    }
+
+
+def _triage_place(i: int, c: dict, around: int) -> str:
+    """One place as the hit triage shows it to Jev."""
+    bl = (c.get("body") or "").splitlines()
+    h = c.get("hit")
+    if h is None:
+        ctx = "\n".join(bl[:around * 2])
+        if c.get("tnames"):
+            ctx += ("\nnames used in the whole body: "
+                    + ", ".join(c["tnames"]))
+    else:
+        lo, hi = max(0, h - around), min(len(bl), h + around + 1)
+        ctx = "\n".join(f"{c['line'] + j}: {bl[j]}" for j in range(lo, hi))
+    return (f"[{i}] {c['file']}:{c['symbol']}:{c['line']} ({c.get('struct') or '?'}) "
+            f"— {c.get('why') or ''}\n{ctx}")
+
+
+def _triage_packed(client, state: dict, hits: list[dict], around: int):
+    """JEV_SPLIT_LONG=1: the hit triage in calls that fit. The places are
+    packed by their real length, with their questions and the fixed fields,
+    into the room of one call (30 places at most, as before). A place too
+    long to fit even alone goes in a call of its own; if Jev refuses that
+    call the place gets no answer and is opened in full, and the other
+    places keep their answers."""
+    room = _jev_call_room()
+    fixed = sum(_jlen(str(v)) for v in state.values()) + 200
+    q_one = _jlen(json.dumps({"h29": _triage_question(29)}))
+    batches: list[list[int]] = [[]]
+    used = fixed
+    for i, c in enumerate(hits):
+        size = _jlen(_triage_place(i, c, around)) + 4 + q_one
+        if batches[-1] and (len(batches[-1]) >= 30 or used + size > room):
+            batches.append([])
+            used = fixed
+        batches[-1].append(i)
+        used += size
+    probs, cost = {}, 0.0
+    for b in batches:
+        p, c_ = _jev_triage_hits(client, state, [hits[i] for i in b], around,
+                                 _packed=True)
+        cost += c_
+        probs.update({b[j]: v for j, v in p.items()})
+    return probs, cost
+
+
+def _jev_triage_hits(client, state: dict, hits: list[dict], around: int = JEV_TRIAGE_AROUND,
+                     _packed: bool = False):
     """One Jev call over the places a followed name was found, before any of
     them is read in full: like a developer scanning search results. `state`
     carries the question, the chain so far and the name. Each hit is shown
@@ -1469,6 +1681,8 @@ def _jev_triage_hits(client, state: dict, hits: list[dict], around: int = JEV_TR
     occurrence. Returns ({index: probability that opening it helps}, cost);
     an empty dict means the call failed (the caller then opens everything,
     as without triage)."""
+    if _split_long() and not _packed:
+        return _triage_packed(client, state, hits, around)
     if len(hits) > 30:
         # many places: several calls of 30, same question each; every place
         # is judged, none is dropped for being one of many
@@ -1480,39 +1694,8 @@ def _jev_triage_hits(client, state: dict, hits: list[dict], around: int = JEV_TR
             probs.update({start + i: v for i, v in p.items()})
             cost += c_
         return probs, cost
-    shown = []
-    for i, c in enumerate(hits):
-        bl = (c.get("body") or "").splitlines()
-        h = c.get("hit")
-        if h is None:
-            ctx = "\n".join(bl[:around * 2])
-            if c.get("tnames"):
-                # JEV_TRIAGE_NAMES=1: the first lines of a definition say
-                # little; the names its whole body uses show where it leads
-                ctx += ("\nnames used in the whole body: "
-                        + ", ".join(c["tnames"]))
-        else:
-            lo, hi = max(0, h - around), min(len(bl), h + around + 1)
-            ctx = "\n".join(f"{c['line'] + j}: {bl[j]}" for j in range(lo, hi))
-        shown.append(f"[{i}] {c['file']}:{c['symbol']}:{c['line']} ({c.get('struct') or '?'}) "
-                     f"— {c.get('why') or ''}\n{ctx}")
-    questions = {}
-    for i in range(len(hits)):
-        questions[f"h{i}"] = {
-            "type": "noul",
-            "instructions": (f"Would reading the whole body of place [{i}] in `places` "
-                             "help answer the `question`, given what is "
-                            "`already_established`? A test, an example or another "
-                             "platform's copy of the same function helps only if the "
-                             "question is about that. A translation or localisation "
-                             "catalog, or another derived copy of text that exists "
-                             "elsewhere in its original form, does not help. A build file, a configure "
-                             "script or a configuration that names the file reached "
-                             "from decides when that file is compiled or used; it "
-                             "helps when the question asks under which conditions, "
-                             "on which platforms or with which options something "
-                             "happens."),
-        }
+    shown = [_triage_place(i, c, around) for i, c in enumerate(hits)]
+    questions = {f"h{i}": _triage_question(i) for i in range(len(hits))}
     payload = {"model": JEV_TRIAGE_MODEL,
                "state": {**state, "places": "\n\n".join(shown)},
                "questions": questions}
@@ -1833,9 +2016,9 @@ def _jev_verdict_names_one(client, state: dict, instructions: str,
                     float(d) if d is not None else 0.0)
         print(f"⚠️  Jev verdict call failed: HTTP {res.status_code} "
               f"{_scrub(res.text[:200])}")
-        return None, {}, 0.0, {}
+        return None, {}, 0.0, {}, 0.0
     print(f"⚠️  Jev chain call gave up after 4 tries: candidate dropped ({_scrub(str(last_err))})")
-    return None, {}, 0.0, {}
+    return None, {}, 0.0, {}, 0.0
 
 
 def _jev_verdict_names_batch(client, shared: dict, items: list[dict],
@@ -2417,7 +2600,47 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                     for c in _raw_candidates(n)]
 
     def _excerpt(body: str, hit: Optional[int]) -> tuple[str, bool]:
+        if _split_long() and os.environ.get("CHAIN_JUDGE", "jev") != "llm":
+            # nothing is cut here: the body was already put in parts that
+            # fit their calls (_plan_parts)
+            return body, False
         return _jev_excerpt(body, hit, body_cap)
+
+    call_room = _jev_call_room()     # JEV_SPLIT_LONG: state and questions together
+
+    def _part_of(n: dict, text: str, first: int, count: int) -> dict:
+        """A body's part as a body of its own; the link line goes along
+        when it lies in this part."""
+        _h = n.get("hit")
+        return {**n, "body": text,
+                "hit": (_h - first if _h is not None
+                        and first <= _h < first + count else None)}
+
+    def _names_in_parts(n: dict, state_of, pool_of):
+        """JEV_SPLIT_LONG=1: the names of a start body, asked part by part.
+        `state_of(text)` is the Jev state for one part, `pool_of(part)` the
+        names offered for it. Returns ({name: best score}, cost, the names
+        picked in any part)."""
+        fixed = sum(_jlen(str(v)) for v in state_of("").values())
+
+        def _over(text, first, count):
+            return fixed + _questions_chars(
+                instructions, pool_of(_part_of(n, text, first, count)))
+
+        picks, cost_, names = {}, 0.0, []
+        for _txt, _f, _n in _plan_parts(n["body"], 0,
+                                        len(n["body"].splitlines()),
+                                        call_room, _over):
+            pool = pool_of(_part_of(n, _txt, _f, _n))
+            if not pool:
+                continue
+            _v, _p, _c, pk, _d = _jev_verdict_names(
+                client, state_of(_txt), instructions, pool)
+            cost_ += _c or 0.0
+            names += [t for t in _picked(pk or {}) if t not in names]
+            for _k, _pr in (pk or {}).items():
+                picks[_k] = max(_pr, picks.get(_k, 0.0))
+        return picks, cost_, names
 
     level: list[dict] = []
     # Per-seed diagnostic: what each start body cost in chain calls and
@@ -2522,11 +2745,19 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
             for n in level:
                 if not n.get("follow") or not n.get("body"):
                     continue
-                _ex, _cut = _excerpt(n["body"], n["hit"])
-                _v, _p, _c, picks, _d = _jev_verdict_names(
-                    client, {"question": question, "file": n["file"],
-                             "symbol": n["symbol"], "code": _ex},
-                    instructions, list(n["follow"]))
+                if _split_long():
+                    # every part is asked about the same names; a name
+                    # keeps its best score
+                    picks, _c, _nm = _names_in_parts(
+                        n, lambda t: {"question": question, "file": n["file"],
+                                      "symbol": n["symbol"], "code": t},
+                        lambda part: list(n["follow"]))
+                else:
+                    _ex, _cut = _excerpt(n["body"], n["hit"])
+                    _v, _p, _c, picks, _d = _jev_verdict_names(
+                        client, {"question": question, "file": n["file"],
+                                 "symbol": n["symbol"], "code": _ex},
+                        instructions, list(n["follow"]))
                 scored += 1
                 cost += _c or 0
                 if n.get("root_i") is not None:
@@ -2562,6 +2793,18 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
             # seed rank 28, and 0.01 on the name that led somewhere new
             _read = {m["symbol"] for m in level if m.get("symbol")}
             def _seed_names(n):
+                if _split_long():
+                    # each part is asked about its own names; the names
+                    # picked in any part are followed
+                    picks, cost_, n["part_names"] = _names_in_parts(
+                        n, lambda t: _strip_desc({
+                            "question": question,
+                            "file": n["file"], "symbol": n["symbol"],
+                            "description": n.get("desc") or "",
+                            "code": t}),
+                        lambda part: [t for t in _name_pool(org_redis, part)
+                                      if t not in _read])
+                    return n, picks, cost_
                 pool = [t for t in _name_pool(org_redis, n) if t not in _read]
                 if not pool:
                     return n, {}, 0.0
@@ -2583,7 +2826,8 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                     per_seed[n["root_i"]]["calls"] += 1
                     per_seed[n["root_i"]]["cost"] += _c
                 if picks:
-                    n["follow"] = _picked(picks)
+                    n["follow"] = (n.pop("part_names") if "part_names" in n
+                                   else _picked(picks))
                     if _seed_both:
                         n["blind_too"] = True
                 decisions.append({
@@ -2836,13 +3080,36 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
             hops += 2 if flat_now else 1
             _fill_descriptions(org_redis, cands)
             _t_v = time.time()
+            def _own_chars(c: dict, text: str, pool: list) -> int:
+                """JEV_SPLIT_LONG: what a call on `text` of this candidate
+                carries next to the text and the earlier steps: its fixed
+                fields, the lines around the link (sent a second time for
+                the local question) and its questions."""
+                around = 0
+                if c.get("hit") is not None:
+                    _bl = c["body"].splitlines()
+                    around = _jlen("\n".join(
+                        _bl[max(0, c["hit"] - window - 1): c["hit"] + window + 2]))
+                return (_jlen(question) + _jlen(c["chain"]) + _jlen(c["why"])
+                        + _jlen(c["file"]) + _jlen(c["symbol"])
+                        + _jlen(c.get("desc") or "") + 2 * around + 600
+                        + _questions_chars(instructions, pool))
+
             def _prep(c: dict):
                 """The Jev state of one candidate and the names it offers."""
                 lk = _link(c)
+                if _split_long():
+                    # the earlier steps get what this call leaves free
+                    _prev = _fit_travel(
+                        lambda n: _prev_steps(c, len(c["excerpt"]) + n),
+                        call_room - _jlen(c["excerpt"]) - _own_chars(
+                            c, c["excerpt"], _name_pool(org_redis, c)))
+                else:
+                    _prev = _prev_steps(c, body_cap)
                 state = _strip_desc({
                     "question": question,
                     "already_established": c["chain"],
-                    "previous_steps": _prev_steps(c, body_cap),
+                    "previous_steps": _prev,
                     "reached_because": c["why"] + (f"; line: `{lk}`" if lk else ""),
                     "file": c["file"], "symbol": c["symbol"],
                     "description": c.get("desc") or "",
@@ -3096,14 +3363,132 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                                + retry
                                + _fmt_picks(picks))
 
-            with ThreadPoolExecutor(max_workers=judge_workers) as ex:
-                if os.environ.get("JEV_BATCH_SIBLINGS", "0") == "1" and not use_llm_judge:
-                    groups: dict = {}
-                    for c in cands:
-                        groups.setdefault(id(c["parent"]), []).append(c)
-                    list(ex.map(_judge_batch, groups.values()))
-                else:
-                    list(ex.map(_judge, cands))
+            # JEV_SPLIT_LONG=1: a body too long for one call is judged in
+            # parts. Each part goes through the same judging as a body of
+            # its own; the answers are joined below.
+            #
+            # A long body is opened where the chain arrived: first only the
+            # part that holds the link line is judged (the first part when
+            # no line led there). The other parts are read only when the
+            # judge accepts that part as evidence. So a long file that is
+            # not evidence costs one call, however long it is.
+            jobs: list[dict] = []
+            for c in cands:
+                spans = []
+                if _split_long() and not use_llm_judge:
+                    spans = _plan_parts(
+                        c["body"], 0, len(c["body"].splitlines()), call_room,
+                        lambda t, f, k, c=c: _own_chars(
+                            _part_of(c, t, f, k), t,
+                            _name_pool(org_redis, _part_of(c, t, f, k))))
+                if len(spans) < 2:
+                    jobs.append(c)
+                    continue
+                c["_parts"] = [
+                    {**_part_of(c, _txt, _f, _n), "_line": (_f, _n),
+                     "why": (c["why"] + f" (this is part {k + 1} of "
+                             f"{len(spans)} of that body)")}
+                    for k, (_txt, _f, _n) in enumerate(spans)]
+                c["_open"] = next((k for k, p in enumerate(c["_parts"])
+                                   if p["hit"] is not None), 0)
+                jobs.append(c["_parts"][c["_open"]])
+
+            def _join_parts(c: dict) -> None:
+                """One answer for a body judged in parts."""
+                parts = c.pop("_parts")
+                read = ([p for p in parts if "verdict" in p]
+                        or [parts[c["_open"]]])
+                best = read[_most_permissive(
+                    [(p.get("verdict"), p.get("probs")) for p in read])]
+                kept = [p for p in parts
+                        if p.get("verdict") in ("accept", "continue")]
+                lead = kept or [p for p in parts if p.get("signpost")]
+                whole = {k: c[k] for k in ("body", "hit", "why")}
+                # everything the judging set comes from the best part,
+                # except what belongs to the whole body
+                c.update(best)
+                c.update(whole)
+                c["signpost"] = not kept and bool(lead)
+                c["follow"], c["picks"] = [], {}
+                for p in (lead or [best]):
+                    c["follow"] += [t for t in (p.get("follow") or [])
+                                    if t not in c["follow"]]
+                    for _k, _pr in (p.get("picks") or {}).items():
+                        c["picks"][_k] = max(_pr, c["picks"].get(_k, 0.0))
+                c["cost"] = sum(p.get("cost") or 0 for p in parts)
+                c["toks"] = (sum((p.get("toks") or (0, 0))[0] for p in parts),
+                             sum((p.get("toks") or (0, 0))[1] for p in parts))
+                # the helper question (JEV_HELPER_KEEP) was asked per part:
+                # the body carries the strongest yes
+                _keeps = [p["keep"] for p in kept if p.get("keep") is not None]
+                if _keeps:
+                    c["keep"] = max(_keeps)
+
+                # What the writer gets: the parts that would go to the
+                # writer as bodies of their own, in their order. An accepted
+                # part is evidence. A "continue" part is a helper and goes
+                # by the rule for helpers (see _wanted below).
+                def _to_writer(p: dict) -> bool:
+                    if p.get("verdict") == "accept":
+                        return True
+                    if p.get("verdict") != "continue":
+                        return False
+                    if helper_keep:
+                        return p.get("keep") is not None and p["keep"] > 0.5
+                    return float((p.get("probs") or {}).get("accept") or 0) >= helper_min
+
+                shown = [p for p in parts if _to_writer(p)] or [best]
+                gap = "… [a part of this body is not shown here] …"
+                text: list[str] = []
+                last = None
+                for p in parts:
+                    if any(p is q for q in shown):
+                        if (last is not None and p["_line"][1] == 1
+                                and last["_line"] == p["_line"]):
+                            # two pieces of one long line: no line end
+                            text[-1] += p.get("excerpt") or ""
+                        else:
+                            text.append(p.get("excerpt") or "")
+                        last = p
+                    else:
+                        if not text or text[-1] != gap:
+                            text.append(gap)
+                        last = None
+                c["excerpt"] = "\n".join(text)
+                c["cut"] = (len(shown) < len(parts)
+                            or any(p.get("cut") for p in shown))
+                c["parted"] = True
+                c["reason"] = (f"{len(parts)} parts: "
+                               + ", ".join(
+                                   p.get("verdict")
+                                   or ("no answer" if "verdict" in p
+                                       else "not read")
+                                   for p in parts)
+                               + f" · {len(shown)} for the writer"
+                               + " · best part: " + (best.get("reason") or ""))
+
+            def _judge_all(todo: list[dict]) -> None:
+                with ThreadPoolExecutor(max_workers=judge_workers) as ex:
+                    if os.environ.get("JEV_BATCH_SIBLINGS", "0") == "1" and not use_llm_judge:
+                        groups: dict = {}
+                        for c in todo:
+                            groups.setdefault(id(c["parent"]), []).append(c)
+                        list(ex.map(_judge_batch, groups.values()))
+                    else:
+                        list(ex.map(_judge, todo))
+
+            _judge_all(jobs)
+            # the rest of every long body whose opened part is evidence
+            rest = [p for c in cands
+                    if c.get("_parts")
+                    and c["_parts"][c["_open"]].get("verdict") == "accept"
+                    for k, p in enumerate(c["_parts"]) if k != c["_open"]]
+            if rest:
+                _judge_all(rest)
+                jobs += rest
+            for c in cands:
+                if "_parts" in c:
+                    _join_parts(c)
             _t_e = time.time()
             # JEV_CALL_TIMES=1: how long the calls of this round took, one by
             # one. It only prints; nothing else changes. Default 0 = as before.
@@ -3122,7 +3507,7 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
                         print(f"   ⏱  {c['_secs']:.2f}s · {c['_chars']:,} chars sent · "
                               f"{c.get('verdict')} · {c['file']} `{c['symbol']}`")
             print(f"⏱  hop {hops}: search {_t_s - _t_h:.2f}s · triage {_tri:.2f}s · "
-                  f"verdicts {_t_e - _t_v:.2f}s ({len(cands)} calls) · "
+                  f"verdicts {_t_e - _t_v:.2f}s ({len(jobs)} calls) · "
                   f"rest {(_t_e - _t_h) - (_t_s - _t_h) - _tri - (_t_e - _t_v):.2f}s")
             scored += len(cands)
             for c in cands:
@@ -3195,19 +3580,51 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
             led = [o for o in (c.get("kids") or []) + (c.get("also") or [])
                    if o.get("verdict") in ("accept", "continue")]
             c["led_n"] = len(led)
-            prev_txt = _prev_steps(c, body_cap)
-            st = _strip_desc({
-                "question": question,
-                "already_established": c["chain"],
-                "previous_steps": prev_txt,
-                "led_to": _led_to(led, body_cap - len(c["excerpt"])
-                                  - len(prev_txt)),
-                "file": c["file"], "symbol": c["symbol"],
-                "description": c.get("desc") or "",
-                "code": c["excerpt"],
-            })
-            raw_v, _p, c["cost"] = _jev_verdict(client, st, instructions,
-                                                JEV_FINAL_MODEL)
+
+            def _final_state(code: str, room=None) -> dict:
+                if room is None:           # as before
+                    prev_txt = _prev_steps({**c, "excerpt": code}, body_cap)
+                    led_txt = _led_to(led, body_cap - len(code) - len(prev_txt))
+                else:                      # JEV_SPLIT_LONG: `room` is what
+                    # the call leaves free next to the code
+                    prev_txt = _fit_travel(
+                        lambda n: _prev_steps({**c, "excerpt": code},
+                                              len(code) + n), room)
+                    led_txt = _fit_travel(
+                        lambda n: _led_to(led, n), room - _jlen(prev_txt))
+                return _strip_desc({
+                    "question": question,
+                    "already_established": c["chain"],
+                    "previous_steps": prev_txt,
+                    "led_to": led_txt,
+                    "file": c["file"], "symbol": c["symbol"],
+                    "description": c.get("desc") or "",
+                    "code": code,
+                })
+
+            if _split_long():
+                # a body kept in parts is judged in parts here too; the
+                # most permissive answer stands. The room counts this
+                # call's own question and fixed fields.
+                _fx = (_jlen(question) + _jlen(c["chain"]) + _jlen(c["file"])
+                       + _jlen(c["symbol"]) + _jlen(c.get("desc") or "") + 600
+                       + _questions_chars(instructions, []))
+                got, c["cost"], st = [], 0.0, {}
+                for _txt, _f, _n in _plan_parts(
+                        c["excerpt"], 0, len(c["excerpt"].splitlines()),
+                        call_room, lambda t, f, k: _fx):
+                    st1 = _final_state(_txt, call_room - _fx - _jlen(_txt))
+                    v1, p1, cost1 = _jev_verdict(client, st1, instructions,
+                                                 JEV_FINAL_MODEL)
+                    c["cost"] += cost1 or 0
+                    got.append((v1, p1, st1))
+                answered = [g for g in got if g[0] is not None] or got
+                raw_v, _p, st = answered[_most_permissive(
+                    [(g[0], g[1]) for g in answered])]
+            else:
+                st = _final_state(c["excerpt"])
+                raw_v, _p, c["cost"] = _jev_verdict(client, st, instructions,
+                                                    JEV_FINAL_MODEL)
             sure = float(os.environ.get("JEV_SURE_REJECT", "0.75"))
             c["final_retry"] = ""
             if raw_v == "reject" and _just_over(_p.get("reject"), sure):
@@ -3322,7 +3739,7 @@ def _jev_expand(question: str, org_redis, seeds: list[dict],
     out: list[dict] = []
     for c in added:
         guard, code = _split_guard(c["excerpt"])
-        if c["cut"]:
+        if c["cut"] and not c.get("parted"):
             code += ("\n… [excerpt only: the part around the link is shown; "
                      "the rest of this body is not shown in this run] …")
         sid = ""
@@ -6908,6 +7325,15 @@ async def ask_stream(req: AskRequest):
         },
     )
 
+
+
+# ── Agent guard ───────────────────────────────────────────────────────────────
+# The guard is in guard.py, its checks in files of their own (rogue.py);
+# this adds its entry points.
+
+import sys
+import guard
+guard.attach(app, sys.modules[__name__])
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
